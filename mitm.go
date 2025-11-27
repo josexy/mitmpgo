@@ -6,7 +6,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -844,7 +843,6 @@ func (r *mitmProxyHandler) forwardStreamBody(rw http.ResponseWriter, body io.Rea
 }
 
 func getAddrPortFromConn(conn net.Conn) (addrport netip.AddrPort) {
-	fmt.Println(conn.RemoteAddr().(*net.TCPAddr))
 	if tcpAddr, ok := conn.RemoteAddr().(*net.TCPAddr); ok {
 		addr, _ := netip.AddrFromSlice(tcpAddr.IP)
 		addrport = netip.AddrPortFrom(addr, uint16(tcpAddr.Port))
