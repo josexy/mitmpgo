@@ -31,10 +31,6 @@ func startSimpleHttpServer(t *testing.T) func() {
 	if err != nil {
 		panic(err)
 	}
-	tlsConfig := &tls.Config{
-		Certificates: []tls.Certificate{certificate},
-	}
-
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok"))
@@ -45,9 +41,11 @@ func startSimpleHttpServer(t *testing.T) func() {
 		Handler: mux,
 	}
 	httpsServer := &http.Server{
-		Addr:      ":9091",
-		Handler:   mux,
-		TLSConfig: tlsConfig,
+		Addr:    ":9091",
+		Handler: mux,
+		TLSConfig: &tls.Config{
+			Certificates: []tls.Certificate{certificate},
+		},
 	}
 	h2cServer := &http.Server{
 		Addr:    ":9092",
@@ -55,9 +53,11 @@ func startSimpleHttpServer(t *testing.T) func() {
 	}
 
 	https1Server := &http.Server{
-		Addr:         ":9093",
-		Handler:      mux,
-		TLSConfig:    tlsConfig,
+		Addr:    ":9093",
+		Handler: mux,
+		TLSConfig: &tls.Config{
+			Certificates: []tls.Certificate{certificate},
+		},
 		TLSNextProto: make(map[string]func(*http.Server, *tls.Conn, http.Handler)),
 	}
 	go func() {

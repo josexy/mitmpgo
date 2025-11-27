@@ -1,6 +1,6 @@
 # mitmpgo
 
-A easy-use and flexible Man-In-The-Middle (MITM) proxy library for Go that enables transparent interception and inspection of HTTP, HTTPS, HTTP/2, and WebSocket traffic.
+An easy-use and flexible Man-In-The-Middle (MITM) proxy library for Go that enables transparent interception and inspection of HTTP, HTTPS, HTTP/2, and WebSocket traffic.
 
 ## Features
 
