@@ -36,15 +36,12 @@ const preboundConnKey contextKey = "prebound-net-conn"
 type reqContextKey struct{}
 
 type ReqContext struct {
-	// used for https proxy and sock5 (connect) proxy
-	Connect  bool
 	Hostport string
 	Request  *http.Request
 }
 
-func AppendToRequestContext(ctx context.Context, connect bool, hostport string, request *http.Request) context.Context {
+func AppendToRequestContext(ctx context.Context, hostport string, request *http.Request) context.Context {
 	reqCtx := ReqContext{
-		Connect:  connect,
 		Hostport: hostport,
 		Request:  request,
 	}
@@ -263,9 +260,7 @@ func (r *mitmProxyHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if err != nil {
 		return
 	}
-	var connect bool
 	if req.Method == http.MethodConnect {
-		connect = true
 		request = nil
 		conn.Write(HttpResponseConnectionEstablished)
 	} else if req.URL != nil && len(req.URL.Scheme) == 0 {
@@ -273,7 +268,7 @@ func (r *mitmProxyHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		err = ErrInvalidProxyRequest
 		return
 	}
-	err = r.Serve(AppendToRequestContext(req.Context(), connect, hostport, request), conn)
+	err = r.Serve(AppendToRequestContext(req.Context(), hostport, request), conn)
 }
 
 func (r *mitmProxyHandler) ServeSOCKS5(ctx context.Context, conn net.Conn) error {
@@ -294,7 +289,7 @@ func (r *mitmProxyHandler) ServeSOCKS5(ctx context.Context, conn net.Conn) error
 	if hostport, err = r.handleSocks5Request(ctx, conn); err != nil {
 		return err
 	}
-	err = r.Serve(AppendToRequestContext(ctx, true, hostport, nil), conn)
+	err = r.Serve(AppendToRequestContext(ctx, hostport, nil), conn)
 	return err
 }
 
@@ -317,25 +312,7 @@ func (r *mitmProxyHandler) Serve(ctx context.Context, conn net.Conn) error {
 	md.Set(metadata.ConnectionSourceAddrPort, getAddrPortFromConn(conn))
 	ctx = metadata.AppendToContext(ctx, md)
 
-	if reqCtx.Connect {
-		// handle https/ws/wss request
-		return r.handleConnectRequest(ctx, conn)
-	} else {
-		// handle common http request(include h2c upgrade)
-		dstConn, err := r.proxyDialer.DialTCPContext(ctx, reqCtx.Hostport)
-		if err != nil {
-			return err
-		}
-		defer dstConn.Close()
-		if !r.disableHTTP2 {
-			rw := newFakeHttpResponseWriter(conn)
-			earlyDone, err := r.handleH2CRequest(ctx, rw, reqCtx.Request, dstConn)
-			if err != nil || earlyDone {
-				return err
-			}
-		}
-		return r.relayConnForHTTP(ctx, conn, dstConn)
-	}
+	return r.handleTunnelRequest(ctx, conn, reqCtx.Request != nil)
 }
 
 func (r *mitmProxyHandler) shouldPassthroughRequest(hostport string) bool {
@@ -364,7 +341,7 @@ func (r *mitmProxyHandler) passthroughTunnel(ctx context.Context, srcConn net.Co
 		return err
 	}
 	// only write the request for none-CONNECT request
-	if !reqCtx.Connect && reqCtx.Request != nil {
+	if reqCtx.Request != nil {
 		// we should copy the request to dst connection firstly
 		// TODO: if upload large file, this will cause performance problem
 		if err = reqCtx.Request.Write(dstConn); err != nil {
@@ -492,24 +469,26 @@ func isTLSRequest(data []byte) bool {
 	return data[0] == 0x16 && data[1] == 0x3 && (data[2] >= 0x1 && data[2] <= 0x3) && data[5] == 0x1
 }
 
-func (r *mitmProxyHandler) handleConnectRequest(ctx context.Context, conn net.Conn) (err error) {
-	bufConn := newBufConn(conn)
-	data, err := bufConn.Peek(6)
-	if err != nil {
-		return err
-	}
-	if len(data) < 6 {
-		return ErrShortTLSPacket
+func (r *mitmProxyHandler) handleTunnelRequest(ctx context.Context, conn net.Conn, consumedRequest bool) (err error) {
+	var data []byte
+
+	if !consumedRequest {
+		bufConn := newBufConn(conn)
+		data, err = bufConn.Peek(6)
+		if err != nil {
+			return err
+		}
+		conn = bufConn
 	}
 
 	var srcConn, dstConn net.Conn
 	// Check if the common http/websocket request with tls
-	if isTLSRequest(data) {
+	if len(data) >= 6 && isTLSRequest(data) {
 		clientHelloInfoCh := make(chan *tls.ClientHelloInfo, 1)
 		tlsConnCh := make(chan net.Conn, 1)
 		tlsConfigCh := make(chan *tls.Config, 1)
 		errCh := make(chan error, 1)
-		tlsConn := tls.Server(bufConn, &tls.Config{
+		tlsConn := tls.Server(conn, &tls.Config{
 			GetConfigForClient: func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
 				clientHelloInfoCh <- chi
 				select {
@@ -571,7 +550,7 @@ func (r *mitmProxyHandler) handleConnectRequest(ctx context.Context, conn net.Co
 		if err != nil {
 			return
 		}
-		srcConn = bufConn
+		srcConn = conn
 	}
 	defer dstConn.Close()
 
@@ -619,44 +598,46 @@ func (r *mitmProxyHandler) handleH2CRequest(ctx context.Context, rw http.Respons
 }
 
 func (r *mitmProxyHandler) distinguishHTTPRequest(ctx context.Context, srcConn, dstConn net.Conn) (newCtx context.Context, earlyDone bool, upgrade bool, retErr error) {
-	newCtx = ctx
 	reqCtx, _ := FromRequestContext(ctx)
 
 	// Read the http request for https/wss via tls tunnel
-	if reqCtx.Connect {
-		fakerw := newFakeHttpResponseWriter(srcConn)
+	fakerw := newFakeHttpResponseWriter(srcConn)
+	request := reqCtx.Request
+
+	// Need to read the request
+	if request == nil {
 		_, rw, err := fakerw.Hijack()
 		if err != nil {
 			retErr = err
 			return
 		}
-		request, err := http.ReadRequest(rw.Reader)
+		request, err = http.ReadRequest(rw.Reader)
 		if err != nil {
 			retErr = err
 			return
 		}
-
-		if !r.disableHTTP2 {
-			// If it's a SOCKS proxy, then the request might be h2c.
-			earlyDone, retErr = r.handleH2CRequest(ctx, fakerw, request, dstConn)
-			if retErr != nil || earlyDone {
-				return
-			}
-		}
-
-		// The request url scheme can be either http or https and we don't care for HTTP1 transport
-		// Because the inner Dial and DialTLS functions were overwritten and replaced with custom net.Conn
-		request.URL.Scheme = "http"
-		request.URL.Host = request.Host
-
-		if upgrade = isWSUpgrade(request.Header); upgrade {
-			request.URL.Scheme = "ws"
-		}
-
-		// patch the new request to the request context
-		reqCtx.Request = request
-		newCtx = AppendToRequestContext(ctx, reqCtx.Connect, reqCtx.Hostport, reqCtx.Request)
 	}
+
+	if !r.disableHTTP2 {
+		// If it's a SOCKS proxy, then the request might be h2c.
+		earlyDone, retErr = r.handleH2CRequest(ctx, fakerw, request, dstConn)
+		if retErr != nil || earlyDone {
+			return
+		}
+	}
+
+	// The request url scheme can be either http or https and we don't care for HTTP1 transport
+	// Because the inner Dial and DialTLS functions were overwritten and replaced with custom net.Conn
+	request.URL.Scheme = "http"
+	request.URL.Host = request.Host
+
+	if upgrade = isWSUpgrade(request.Header); upgrade {
+		request.URL.Scheme = "ws"
+	}
+
+	// patch the new request to the request context
+	reqCtx.Request = request
+	newCtx = AppendToRequestContext(ctx, reqCtx.Hostport, reqCtx.Request)
 
 	return
 }
@@ -771,7 +752,7 @@ func (r *mitmProxyHandler) serveHTTP2Handler(ctx context.Context, dstConn net.Co
 		if req.URL.Host == "" {
 			req.URL.Host = req.Host
 		}
-		ctx = AppendToRequestContext(ctx, reqCtx.Connect, reqCtx.Hostport, req)
+		ctx = AppendToRequestContext(ctx, reqCtx.Hostport, req)
 		response, err := r.roundTripWithContext(ctx, dstConn)
 		if err != nil {
 			r.handleError(ErrorContext{
