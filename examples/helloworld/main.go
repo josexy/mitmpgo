@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -10,7 +11,6 @@ import (
 	"syscall"
 
 	"github.com/josexy/mitmpgo"
-	"github.com/josexy/mitmpgo/metadata"
 )
 
 func main() {
@@ -25,28 +25,26 @@ func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	slog.SetDefault(logger)
 
+	httpInterceptor := func(ctx context.Context, req *http.Request, invoker mitmpgo.HTTPDelegatedInvoker) (*http.Response, error) {
+		slog.Debug("request", slog.String("host", req.Host), slog.String("method", req.Method), slog.String("url", req.URL.String()))
+
+		rsp, err := invoker.Invoke(req)
+		if err != nil {
+			return rsp, err
+		}
+
+		slog.Debug("response", slog.String("status", rsp.Status), slog.String("protocol", rsp.Proto))
+		return rsp, err
+	}
+
 	handler, err := mitmpgo.NewMitmProxyHandler(
 		mitmpgo.WithCACertPath(caCertPath),
 		mitmpgo.WithCAKeyPath(caKeyPath),
+		mitmpgo.WithHTTPInterceptor(httpInterceptor),
 	)
 	if err != nil {
 		panic(err)
 	}
-
-	handler.SetHTTPInterceptor(mitmpgo.HTTPInterceptorFunc(
-		func(md metadata.HttpMD, invoker mitmpgo.HTTPDelegatedInvoker) (*http.Response, error) {
-			req := md.Request
-			slog.Debug("request", slog.String("host", req.Host), slog.String("method", req.Method), slog.String("url", req.URL.String()))
-
-			rsp, err := invoker.Invoke(req)
-			if err != nil {
-				return rsp, err
-			}
-
-			slog.Debug("response", slog.String("status", rsp.Status), slog.String("protocol", rsp.Proto))
-			return rsp, err
-		}),
-	)
 
 	slog.Info("server started")
 	go func() {

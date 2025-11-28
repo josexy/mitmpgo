@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
@@ -10,7 +11,6 @@ import (
 	"strings"
 
 	"github.com/josexy/mitmpgo"
-	"github.com/josexy/mitmpgo/metadata"
 )
 
 func main() {
@@ -25,43 +25,42 @@ func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	slog.SetDefault(logger)
 
-	handler, err := mitmpgo.NewMitmProxyHandler(
-		mitmpgo.WithCACertPath(caCertPath),
-		mitmpgo.WithCAKeyPath(caKeyPath),
-	)
-	if err != nil {
-		panic(err)
-	}
-
-	handler.SetErrorHandler(mitmpgo.ErrorHandlerFunc(func(ec mitmpgo.ErrorContext) {
+	errorHandler := func(ec mitmpgo.ErrorContext) {
 		slog.Error("mitm proxy error",
 			slog.String("remote_addr", ec.RemoteAddr),
 			slog.String("hostport", ec.Hostport),
 			slog.String("error", ec.Error.Error()),
 		)
-	}))
+	}
 
-	handler.SetHTTPInterceptor(mitmpgo.HTTPInterceptorFunc(
-		func(md metadata.HttpMD, invoker mitmpgo.HTTPDelegatedInvoker) (*http.Response, error) {
-			req := md.Request
-			req.Header.Add("X-MITMPGO-REQ-HEADER", "MITMPGO")
+	httpInterceptor := func(ctx context.Context, req *http.Request, invoker mitmpgo.HTTPDelegatedInvoker) (*http.Response, error) {
+		req.Header.Add("X-MITMPGO-REQ-HEADER", "MITMPGO")
 
-			rsp, err := invoker.Invoke(req)
-			if err != nil {
-				return rsp, err
-			}
-
-			slog.Debug("HTTP",
-				slog.Group("request", slog.String("host", req.Host), slog.String("method", req.Method), slog.String("url", req.URL.String())),
-				slog.Group("response", slog.String("status", rsp.Status), slog.String("protocol", rsp.Proto)),
-			)
-
-			rsp.Header.Add("X-MITMPGO-RSP-HEADER", "MITMPGO")
-			rsp.Body.Close()
-			rsp.Body = io.NopCloser(strings.NewReader("hello!"))
+		rsp, err := invoker.Invoke(req)
+		if err != nil {
 			return rsp, err
-		}),
+		}
+
+		slog.Debug("HTTP",
+			slog.Group("request", slog.String("host", req.Host), slog.String("method", req.Method), slog.String("url", req.URL.String())),
+			slog.Group("response", slog.String("status", rsp.Status), slog.String("protocol", rsp.Proto)),
+		)
+
+		rsp.Header.Add("X-MITMPGO-RSP-HEADER", "MITMPGO")
+		rsp.Body.Close()
+		rsp.Body = io.NopCloser(strings.NewReader("hello!"))
+		return rsp, err
+	}
+
+	handler, err := mitmpgo.NewMitmProxyHandler(
+		mitmpgo.WithCACertPath(caCertPath),
+		mitmpgo.WithCAKeyPath(caKeyPath),
+		mitmpgo.WithHTTPInterceptor(httpInterceptor),
+		mitmpgo.WithErrorHandler(errorHandler),
 	)
+	if err != nil {
+		panic(err)
+	}
 
 	slog.Info("server started")
 	http.ListenAndServe(fmt.Sprintf("%s:%d", "127.0.0.1", port), handler)
