@@ -116,19 +116,9 @@ type ErrorContext struct {
 	Error      error
 }
 
-type ErrorHandler interface {
-	Error(ErrorContext)
-}
-
-type ErrorHandlerFunc func(ErrorContext)
-
-func (f ErrorHandlerFunc) Error(e ErrorContext) { f(e) }
+type ErrorHandler func(ErrorContext)
 
 type MitmProxyHandler interface {
-	SetHTTPInterceptor(HTTPInterceptor)
-	SetWebsocketInterceptor(WebsocketInterceptor)
-	SetErrorHandler(ErrorHandler)
-
 	// low-level api
 	Serve(context.Context, net.Conn) error
 	// high-level application api
@@ -138,16 +128,11 @@ type MitmProxyHandler interface {
 
 type mitmProxyHandler struct {
 	*options
-	proxyDialer  *proxyDialer
-	priKeyPool   *priKeyPool
-	certPool     *certPool
-	h2s          *http2.Server
-	transport    *UnifiedTransport
-	errorHandler ErrorHandler
-	interceptors struct {
-		HTTPInterceptor
-		WebsocketInterceptor
-	}
+	proxyDialer   *proxyDialer
+	priKeyPool    *priKeyPool
+	certPool      *certPool
+	h2s           *http2.Server
+	transport     *UnifiedTransport
 	domainMatcher struct {
 		include *trieNode
 		exclude *trieNode
@@ -214,19 +199,41 @@ func NewMitmProxyHandler(opt ...Option) (MitmProxyHandler, error) {
 	}
 	handler.domainMatcher.include = includeMatcher
 	handler.domainMatcher.exclude = excludeMatcher
+	handler.chainHTTPInterceptors()
+	handler.chainWebsocketInterceptors()
 	return handler, nil
 }
 
-func (r *mitmProxyHandler) SetHTTPInterceptor(fn HTTPInterceptor) {
-	r.interceptors.HTTPInterceptor = fn
+func (r *mitmProxyHandler) chainHTTPInterceptors() {
+	interceptors := r.chainHttpInts
+	if r.httpInt != nil {
+		interceptors = append([]HTTPInterceptor{r.httpInt}, r.chainHttpInts...)
+	}
+	var chainedInt HTTPInterceptor
+	if len(interceptors) == 0 {
+		chainedInt = nil
+	} else if len(interceptors) == 1 {
+		chainedInt = interceptors[0]
+	} else {
+		chainedInt = chainHTTPInterceptors(interceptors)
+	}
+	r.httpInt = chainedInt
 }
 
-func (r *mitmProxyHandler) SetWebsocketInterceptor(fn WebsocketInterceptor) {
-	r.interceptors.WebsocketInterceptor = fn
-}
-
-func (r *mitmProxyHandler) SetErrorHandler(handler ErrorHandler) {
-	r.errorHandler = handler
+func (r *mitmProxyHandler) chainWebsocketInterceptors() {
+	interceptors := r.chainWsInts
+	if r.wsInt != nil {
+		interceptors = append([]WebsocketInterceptor{r.wsInt}, r.chainWsInts...)
+	}
+	var chainedInt WebsocketInterceptor
+	if len(interceptors) == 0 {
+		chainedInt = nil
+	} else if len(interceptors) == 1 {
+		chainedInt = interceptors[0]
+	} else {
+		chainedInt = chainWebsocketInterceptors(interceptors)
+	}
+	r.wsInt = chainedInt
 }
 
 func (r *mitmProxyHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
@@ -368,8 +375,8 @@ func (r *mitmProxyHandler) passthroughTunnel(ctx context.Context, srcConn net.Co
 }
 
 func (r *mitmProxyHandler) handleError(ec ErrorContext) {
-	if r.errorHandler != nil && ec.Error != nil {
-		r.errorHandler.Error(ec)
+	if r.errHandler != nil && ec.Error != nil {
+		r.errHandler(ec)
 	}
 }
 
@@ -685,30 +692,24 @@ func (r *mitmProxyHandler) relayConnForWS(ctx context.Context, srcConn, dstConn 
 	resp.Body.Close()
 
 	errCh := make(chan error, 2)
-	relayWSMessage := func(dir metadata.WSDirection, src, dst *websocket.Conn) {
+	relayWSMessage := func(dir WSDirection, src, dst *websocket.Conn) {
 		for {
 			msgType, buffer, err := readBufferFromWSConn(src)
 			if err != nil {
 				errCh <- err
 				break
 			}
-			if r.interceptors.WebsocketInterceptor != nil {
+			if r.wsInt != nil {
 				md.Set(metadata.ConnectionDestinationAddrPort, getAddrPortFromConn(dstConn))
-				wsmd := metadata.WsMD{
-					MD:        md.MD(),
-					Direction: dir,
-					MsgType:   msgType,
-					Request:   reqCtx.Request,
-				}
-				r.interceptors.WebsocketInterceptor.InvokeInterceptor(wsmd, buffer, wrapperInvoker(dst.WriteMessage))
+				r.wsInt(ctx, dir, msgType, buffer, reqCtx.Request, wrapperInvoker(dst.WriteMessage))
 			} else {
 				dst.WriteMessage(msgType, buffer.Bytes())
 			}
 			releaseBuffer(buffer)
 		}
 	}
-	go relayWSMessage(metadata.Send, wsSrcConn, wsDstConn)
-	go relayWSMessage(metadata.Receive, wsDstConn, wsSrcConn)
+	go relayWSMessage(Send, wsSrcConn, wsDstConn)
+	go relayWSMessage(Receive, wsDstConn, wsSrcConn)
 	err = <-errCh
 	return
 }
@@ -731,13 +732,9 @@ func (r *mitmProxyHandler) roundTripWithContext(ctx context.Context, dstConn net
 	req = req.WithContext(newCtx)
 
 	// Only one http interceptor will be invoked
-	if r.interceptors.HTTPInterceptor != nil {
+	if r.httpInt != nil {
 		md.Set(metadata.ConnectionDestinationAddrPort, getAddrPortFromConn(dstConn))
-		httpmd := metadata.HttpMD{
-			MD:      md.MD(),
-			Request: req,
-		}
-		response, err = r.interceptors.HTTPInterceptor.InvokeInterceptor(httpmd, HTTPDelegatedInvokerFunc(r.transport.RoundTrip))
+		response, err = r.httpInt(ctx, req, HTTPDelegatedInvokerFunc(r.transport.RoundTrip))
 	} else {
 		response, err = r.transport.RoundTrip(req)
 	}

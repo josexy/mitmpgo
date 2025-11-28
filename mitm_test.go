@@ -1,6 +1,7 @@
 package mitmpgo_test
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509/pkix"
 	"net"
@@ -13,7 +14,6 @@ import (
 
 	"github.com/josexy/mitmpgo"
 	"github.com/josexy/mitmpgo/internal/cert"
-	"github.com/josexy/mitmpgo/metadata"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 )
@@ -149,19 +149,19 @@ func genServerCertAndKey() {
 	os.WriteFile(serverKeyPath, keyPem, 0644)
 }
 
-func startmitmpgo(t *testing.T, interceptor mitmpgo.HTTPInterceptorFunc) mitmpgo.MitmProxyHandler {
+func startmitmpgo(t *testing.T, interceptor mitmpgo.HTTPInterceptor) mitmpgo.MitmProxyHandler {
 	handler, err := mitmpgo.NewMitmProxyHandler(
 		mitmpgo.WithCACertPath(mitmCertPath),
 		mitmpgo.WithCAKeyPath(mitmKeyPath),
 		mitmpgo.WithRootCAs(serverCertPath),
+		mitmpgo.WithHTTPInterceptor(interceptor),
+		mitmpgo.WithErrorHandler(func(ec mitmpgo.ErrorContext) {
+			t.Log(ec.RemoteAddr, ec.Hostport, ec.Error)
+		}),
 	)
 	if err != nil {
 		panic(err)
 	}
-	handler.SetErrorHandler(mitmpgo.ErrorHandlerFunc(func(ec mitmpgo.ErrorContext) {
-		t.Log(ec.RemoteAddr, ec.Hostport, ec.Error)
-	}))
-	handler.SetHTTPInterceptor(interceptor)
 	return handler
 }
 
@@ -170,9 +170,9 @@ func TestMitmProxyHandler(t *testing.T) {
 	genServerCertAndKey()
 	defer os.RemoveAll(certdir)
 
-	handler := startmitmpgo(t, func(hm metadata.HttpMD, hi mitmpgo.HTTPDelegatedInvoker) (*http.Response, error) {
-		resp, err := hi.Invoke(hm.Request)
-		t.Logf("url: %s, req_proto: %s, rsp_proto: %s", hm.Request.URL, hm.Request.Proto, resp.Proto)
+	handler := startmitmpgo(t, func(ctx context.Context, req *http.Request, hi mitmpgo.HTTPDelegatedInvoker) (*http.Response, error) {
+		resp, err := hi.Invoke(req)
+		t.Logf("url: %s, req_proto: %s, rsp_proto: %s", req.URL, req.Proto, resp.Proto)
 		return resp, err
 	})
 

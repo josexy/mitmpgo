@@ -38,6 +38,12 @@ type options struct {
 
 	rootCACertPool *x509.CertPool // System and custom root CA certificate pool
 	caCert         *cert.Cert     // Loaded CA certificate for TLS interception
+
+	errHandler    ErrorHandler
+	httpInt       HTTPInterceptor
+	wsInt         WebsocketInterceptor
+	chainHttpInts []HTTPInterceptor
+	chainWsInts   []WebsocketInterceptor
 }
 
 // newOptions creates a new options instance with default values.
@@ -275,5 +281,155 @@ func WithIncludeHosts(hosts ...string) Option {
 func WithExcludeHosts(hosts ...string) Option {
 	return OptionFunc(func(o *options) {
 		o.excludeHosts = hosts
+	})
+}
+
+// WithErrorHandler sets a custom error handler for the proxy.
+// The error handler is called when errors occur during proxy operations.
+//
+// The ErrorHandler receives an ErrorContext containing:
+//   - RemoteAddr: The client's remote address
+//   - Hostport: The target host:port being accessed
+//   - Error: The error that occurred
+//
+// If not specified, errors are silently ignored (no default handler).
+//
+// Example:
+//
+//	handler, err := NewMitmProxyHandler(
+//	    WithErrorHandler(func(ec ErrorContext) {
+//	        log.Printf("[%s -> %s] Error: %v", ec.RemoteAddr, ec.Hostport, ec.Error)
+//	    }),
+//	)
+func WithErrorHandler(handler ErrorHandler) Option {
+	return OptionFunc(func(o *options) {
+		o.errHandler = handler
+	})
+}
+
+// WithHTTPInterceptor sets a custom HTTP interceptor for the proxy.
+// The interceptor allows you to inspect and modify HTTP requests and responses
+// as they pass through the proxy.
+//
+// The HTTPInterceptor is called for each HTTP request with:
+//   - context.Context: Request context containing metadata (TLS state, timing, etc.)
+//   - *http.Request: The HTTP request to be sent to the server
+//   - HTTPDelegatedInvoker: Delegate to invoke the actual request (call to continue the chain)
+//
+// The interceptor can:
+//   - Inspect/modify the request before forwarding
+//   - Call the invoker to forward the request to the server
+//   - Inspect/modify the response before returning to the client
+//   - Short-circuit the request and return a custom response
+//
+// Example:
+//
+//	handler, err := NewMitmProxyHandler(
+//	    WithHTTPInterceptor(func(ctx context.Context, req *http.Request, invoker HTTPDelegatedInvoker) (*http.Response, error) {
+//	        log.Printf("Request: %s %s", req.Method, req.URL)
+//	        // Forward request to server
+//	        resp, err := invoker.Invoke(req)
+//	        if err != nil {
+//	            return nil, err
+//	        }
+//	        log.Printf("Response: %d", resp.StatusCode)
+//	        return resp, nil
+//	    }),
+//	)
+func WithHTTPInterceptor(interceptor HTTPInterceptor) Option {
+	return OptionFunc(func(o *options) {
+		o.httpInt = interceptor
+	})
+}
+
+// WithWebsocketInterceptor sets a custom WebSocket interceptor for the proxy.
+// The interceptor allows you to inspect and modify WebSocket messages
+// in both directions (client-to-server and server-to-client) as they pass through the proxy.
+//
+// The WebsocketInterceptor is called for each WebSocket message with:
+//   - context.Context: Request context containing metadata
+//   - metadata.WSDirection: Message direction
+//   - int: WebSocket message type
+//   - *buf.Buffer: Message data buffer (can be read and modified)
+//   - *http.Request: The original HTTP upgrade request
+//   - WebsocketDelegatedInvoker: Delegate to invoke message forwarding (call to continue)
+//
+// The interceptor can:
+//   - Inspect/modify message data before forwarding
+//   - Call the invoker to forward the message
+//   - Drop messages by not calling the invoker
+//   - Inject custom messages by calling the invoker multiple times
+//
+// Example:
+//
+//	handler, err := NewMitmProxyHandler(
+//	    WithWebsocketInterceptor(func(ctx context.Context, dir metadata.WSDirection, msgType int, data *buf.Buffer, req *http.Request, invoker WebsocketDelegatedInvoker) error {
+//	        log.Printf("[%s] WebSocket message: type=%d, size=%d", dir, msgType, data.Len())
+//	        // Forward message
+//	        return invoker.Invoke(msgType, data)
+//	    }),
+//	)
+func WithWebsocketInterceptor(interceptor WebsocketInterceptor) Option {
+	return OptionFunc(func(o *options) {
+		o.wsInt = interceptor
+	})
+}
+
+// WithChainHTTPInterceptor chains multiple HTTP interceptors together.
+// Interceptors are executed in the order they are provided, forming a middleware chain.
+// Each interceptor can modify the request, call the next interceptor in the chain,
+// and modify the response. And The final interceptor will forwards the request to the server.
+//
+// Example:
+//
+//	loggingInterceptor := func(ctx context.Context, req *http.Request, invoker HTTPDelegatedInvoker) (*http.Response, error) {
+//	    log.Printf("→ %s %s", req.Method, req.URL)
+//	    resp, err := invoker.Invoke(req)
+//	    if resp != nil {
+//	        log.Printf("← %d", resp.StatusCode)
+//	    }
+//	    return resp, err
+//	}
+//
+//	modifyInterceptor := func(ctx context.Context, req *http.Request, invoker HTTPDelegatedInvoker) (*http.Response, error) {
+//	    req.Header.Set("X-Custom-Header", "value")
+//	    return invoker.Invoke(req)
+//	}
+//
+//	handler, err := NewMitmProxyHandler(
+//	    WithChainHTTPInterceptor(loggingInterceptor, modifyInterceptor),
+//	)
+func WithChainHTTPInterceptor(interceptors ...HTTPInterceptor) Option {
+	return OptionFunc(func(o *options) {
+		o.chainHttpInts = append(o.chainHttpInts, interceptors...)
+	})
+}
+
+// WithChainWebsocketInterceptor chains multiple WebSocket interceptors together.
+// Interceptors are executed in the order they are provided, forming a middleware chain.
+// Each interceptor can inspect/modify the WebSocket message, call the next interceptor,
+// and handle the message forwarding. And The final interceptor will forwards the message.
+//
+// Example:
+//
+//	loggingInterceptor := func(ctx context.Context, dir metadata.WSDirection, msgType int, data *buf.Buffer, req *http.Request, invoker WebsocketDelegatedInvoker) error {
+//	    log.Printf("[%s] Message: type=%d, size=%d", dir, msgType, data.Len())
+//	    return invoker.Invoke(msgType, data)
+//	}
+//
+//	filterInterceptor := func(ctx context.Context, dir metadata.WSDirection, msgType int, data *buf.Buffer, req *http.Request, invoker WebsocketDelegatedInvoker) error {
+//	    // Drop ping messages
+//	    if msgType == websocket.PingMessage {
+//	        return nil
+//	    }
+//	    return invoker.Invoke(msgType, data)
+//	}
+//
+//	handler, err := NewMitmProxyHandler(
+//	    WithChainWebsocketInterceptor(loggingInterceptor, filterInterceptor),
+//	)
+func WithChainWebsocketInterceptor(interceptors ...WebsocketInterceptor) Option {
+	return OptionFunc(func(o *options) {
+		o.chainWsInts = append(o.chainWsInts, interceptors...)
 	})
 }

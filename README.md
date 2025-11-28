@@ -60,42 +60,47 @@ func main() {
 ### With HTTP Interceptor
 
 ```go
-handler.SetHTTPInterceptor(mitmpgo.HTTPInterceptorFunc(
-    func(md metadata.HttpMD, invoker mitmpgo.HTTPDelegatedInvoker) (*http.Response, error) {
-        req := md.Request
+httpInterceptor := func(ctx context.Context, req *http.Request, invoker mitmpgo.HTTPDelegatedInvoker) (*http.Response, error) {
+    // Log request details
+    fmt.Printf("→ %s %s\n", req.Method, req.URL)
+    fmt.Printf("  Host: %s\n", req.Host)
+    fmt.Printf("  Proto: %s\n", req.Proto)
 
-        // Log request details
-        fmt.Printf("→ %s %s\n", req.Method, req.URL)
-        fmt.Printf("  Host: %s\n", req.Host)
-        fmt.Printf("  Proto: %s\n", req.Proto)
+    // Forward the request
+    resp, err := invoker.Invoke(req)
+    if err != nil {
+        return nil, err
+    }
 
-        // Forward the request
-        resp, err := invoker.Invoke(req)
-        if err != nil {
-            return nil, err
-        }
+    // Log response details
+    fmt.Printf("← %s\n", resp.Status)
 
-        // Log response details
-        fmt.Printf("← %s\n", resp.Status)
+    return resp, nil
+}
 
-        return resp, nil
-    },
-))
+handler, err := mitmpgo.NewMitmProxyHandler(
+    mitmpgo.WithCACertPath("certs/ca.crt"),
+    mitmpgo.WithCAKeyPath("certs/ca.key"),
+    mitmpgo.WithHTTPInterceptor(httpInterceptor),
+)
 ```
 
 ### With WebSocket Interceptor
 
 ```go
-handler.SetWebsocketInterceptor(mitmpgo.WebsocketInterceptorFunc(
-    func(md metadata.WsMD, buffer *buf.Buffer, invoker mitmpgo.WebsocketDelegatedInvoker) error {
-        // Log WebSocket messages
-        fmt.Printf("WS [%s] %s: %d bytes\n",
-            md.Direction, md.Request.URL, buffer.Len())
+websocketInterceptor := func(ctx context.Context, dir metadata.WSDirection, msgType int, b *buf.Buffer, req *http.Request, invoker mitmpgo.WebsocketDelegatedInvoker) error {
+    // Log WebSocket messages
+    fmt.Printf("WS [%s] %s: %d bytes\n", dir, req.URL, b.Len())
 
-        // Forward the message
-        return invoker.Invoke(md.MsgType, buffer)
-    },
-))
+    // Forward the message
+    return invoker.Invoke(msgType, b)
+}
+
+handler, err := mitmpgo.NewMitmProxyHandler(
+    mitmpgo.WithCACertPath("certs/ca.crt"),
+    mitmpgo.WithCAKeyPath("certs/ca.key"),
+    mitmpgo.WithWebsocketInterceptor(websocketInterceptor),
+)
 ```
 
 ### SOCKS5 Proxy Mode
@@ -160,6 +165,27 @@ mitmpgo.WithDialer(&net.Dialer{
 })
 ```
 
+### Interceptor Options
+
+```go
+// Set HTTP interceptor
+mitmpgo.WithHTTPInterceptor(httpInterceptor)
+
+// Set WebSocket interceptor
+mitmpgo.WithWebsocketInterceptor(websocketInterceptor)
+
+// Chain multiple HTTP interceptors (executed in order)
+mitmpgo.WithChainHTTPInterceptor(interceptor1, interceptor2, interceptor3)
+
+// Chain multiple WebSocket interceptors (executed in order)
+mitmpgo.WithChainWebsocketInterceptor(wsInterceptor1, wsInterceptor2)
+
+// Set error handler
+mitmpgo.WithErrorHandler(func(ec mitmpgo.ErrorContext) {
+    log.Printf("Error: %v", ec.Error)
+})
+```
+
 ### Security Options
 
 ```go
@@ -186,46 +212,40 @@ mitmpgo.WithExcludeHosts("*.cdn.com", "static.example.com")
 
 ## Metadata Access
 
-Interceptors receive rich metadata about the connection:
+Interceptors can access metadata from the context:
 
 ```go
-handler.SetHTTPInterceptor(mitmpgo.HTTPInterceptorFunc(
-    func(md metadata.HttpMD, invoker mitmpgo.HTTPDelegatedInvoker) (*http.Response, error) {
-        // Timing information
-        fmt.Printf("Connection established at: %v\n", md.ConnectionEstablishedTs)
-        fmt.Printf("SSL handshake duration: %v\n",
-            md.SSLHandshakeCompletedTs.Sub(md.ConnectionEstablishedTs))
+httpInterceptor := func(ctx context.Context, req *http.Request, invoker mitmpgo.HTTPDelegatedInvoker) (*http.Response, error) {
+    // Extract metadata from context
+    mdCtx, _ := metadata.FromContext(ctx)
+    md := mdCtx.MD()
 
-        // Connection details
-        fmt.Printf("Source: %s\n", md.SourceAddr)
-        fmt.Printf("Destination: %s\n", md.DestinationAddr)
+    // Timing information
+    fmt.Printf("Connection established at: %v\n", md.ConnectionEstablishedTs)
+    fmt.Printf("SSL handshake duration: %v\n",
+        md.SSLHandshakeCompletedTs.Sub(md.ConnectionEstablishedTs))
 
-        // TLS information (if HTTPS)
-        if md.TLSState != nil {
-            fmt.Printf("ALPN: %s\n", md.TLSState.SelectedALPN)
-            fmt.Printf("TLS Version: %d\n", md.TLSState.SelectedTLSVersion)
-            fmt.Printf("Cipher Suite: %d\n", md.TLSState.SelectedCipherSuite)
-        }
+    // Connection details
+    fmt.Printf("Source: %s\n", md.SourceAddr)
+    fmt.Printf("Destination: %s\n", md.DestinationAddr)
 
-        // Server certificate (if HTTPS)
-        if md.ServerCertificate != nil {
-            fmt.Printf("Certificate Subject: %v\n", md.ServerCertificate.Subject)
-            fmt.Printf("Certificate Issuer: %v\n", md.ServerCertificate.Issuer)
-            fmt.Printf("DNS Names: %v\n", md.ServerCertificate.DNSNames)
-        }
+    // TLS information (if HTTPS)
+    if md.TLSState != nil {
+        fmt.Printf("ALPN: %s\n", md.TLSState.SelectedALPN)
+        fmt.Printf("TLS Version: %s\n", tls.VersionName(md.TLSState.SelectedTLSVersion))
+        fmt.Printf("Cipher Suite: %s\n", tls.CipherSuiteName(md.TLSState.SelectedCipherSuite))
+    }
 
-        return invoker.Invoke(md.Request)
-    },
-))
-```
+    // Server certificate (if HTTPS)
+    if md.ServerCertificate != nil {
+        fmt.Printf("Certificate Subject: %v\n", md.ServerCertificate.Subject)
+        fmt.Printf("Certificate Issuer: %v\n", md.ServerCertificate.Issuer)
+        fmt.Printf("DNS Names: %v\n", md.ServerCertificate.DNSNames)
+        fmt.Printf("SHA256 Fingerprint: %s\n", md.ServerCertificate.Sha256FingerprintHex())
+    }
 
-## Error Handling
-
-```go
-handler.SetErrorHandler(mitmpgo.ErrorHandlerFunc(func(ec mitmpgo.ErrorContext) {
-    log.Printf("Proxy error - Remote: %s, Host: %s, Error: %v",
-        ec.RemoteAddr, ec.Hostport, ec.Error)
-}))
+    return invoker.Invoke(req)
+}
 ```
 
 ## Examples

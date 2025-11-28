@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"math/big"
 	"net"
-	"net/http"
 	"net/netip"
 	"strings"
 	"time"
@@ -35,27 +34,6 @@ const (
 	// ConnectionServerCertificate is the server's certificate from the TLS handshake
 	ConnectionServerCertificate = "connection_server_certificate"
 )
-
-// WSDirection indicates the direction of a WebSocket message
-type WSDirection byte
-
-const (
-	// Send indicates a message sent from client to server
-	Send WSDirection = iota
-	// Receive indicates a message received from server to client
-	Receive
-)
-
-func (d WSDirection) String() string {
-	switch d {
-	case Send:
-		return "Send"
-	case Receive:
-		return "Receive"
-	default:
-		return "Unknown"
-	}
-}
 
 // TLSState captures TLS negotiation parameters from both client and server
 type TLSState struct {
@@ -127,18 +105,4 @@ type MD struct {
 	DestinationAddr         netip.AddrPort     // Destination server's IP address and port
 	TLSState                *TLSState          // TLS negotiation details (nil if non-TLS)
 	ServerCertificate       *ServerCertificate // Server's certificate (nil if non-TLS)
-}
-
-// HttpMD extends MD with HTTP-specific request information
-type HttpMD struct {
-	MD
-	Request *http.Request // The HTTP request being processed
-}
-
-// WsMD extends MD with WebSocket-specific message information
-type WsMD struct {
-	MD
-	MsgType   int           // WebSocket message type
-	Direction WSDirection   // Message direction (Send or Receive)
-	Request   *http.Request // The original HTTP request that was upgraded to WebSocket
 }
