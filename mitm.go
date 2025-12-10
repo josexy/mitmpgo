@@ -116,6 +116,8 @@ type ErrorContext struct {
 type ErrorHandler func(ErrorContext)
 
 type MitmProxyHandler interface {
+	CACertPath() string
+
 	// low-level api
 	Serve(context.Context, net.Conn) error
 	// high-level application api
@@ -231,6 +233,10 @@ func (r *mitmProxyHandler) chainWebsocketInterceptors() {
 		chainedInt = chainWebsocketInterceptors(interceptors)
 	}
 	r.wsInt = chainedInt
+}
+
+func (r *mitmProxyHandler) CACertPath() string {
+	return r.caCertPath
 }
 
 func (r *mitmProxyHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
