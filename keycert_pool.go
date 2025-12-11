@@ -11,7 +11,7 @@ import (
 	"github.com/josexy/mitmpgo/internal/cert"
 )
 
-var errNoPriKey = errors.New("no private key available")
+var errNoPriKey = errors.New("no available private key")
 
 type priKeyPool struct {
 	rand *rand.Rand
