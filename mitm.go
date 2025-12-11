@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -143,7 +144,7 @@ func NewMitmProxyHandler(opt ...Option) (MitmProxyHandler, error) {
 	var err error
 	opts.caCert, err = cert.LoadCACertificate(opts.caCertPath, opts.caKeyPath)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to load ca cert: %s", err)
 	}
 	if len(opts.rootCAs) > 0 {
 		opts.rootCACertPool, err = x509.SystemCertPool()
@@ -153,7 +154,7 @@ func NewMitmProxyHandler(opt ...Option) (MitmProxyHandler, error) {
 		for _, path := range opts.rootCAs {
 			ca, err := os.ReadFile(path)
 			if err != nil {
-				return nil, err
+				return nil, fmt.Errorf("failed to read root ca file: %s", err)
 			}
 			if ok := opts.rootCACertPool.AppendCertsFromPEM(ca); !ok {
 				return nil, errors.New("failed to append ca file to cert pool")
@@ -162,7 +163,7 @@ func NewMitmProxyHandler(opt ...Option) (MitmProxyHandler, error) {
 	}
 	proxyURL, err := parseProxyFrom(opts.disableProxy, opts.proxy)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to parse proxy url: %s", err)
 	}
 
 	dialFn := func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -274,7 +275,7 @@ func (r *mitmProxyHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		err = ErrInvalidProxyRequest
 		return
 	}
-	err = r.Serve(AppendToRequestContext(req.Context(), hostport, request), conn)
+	_ = r.Serve(AppendToRequestContext(req.Context(), hostport, request), conn)
 }
 
 func (r *mitmProxyHandler) ServeSOCKS5(ctx context.Context, conn net.Conn) error {
@@ -283,7 +284,7 @@ func (r *mitmProxyHandler) ServeSOCKS5(ctx context.Context, conn net.Conn) error
 	defer func() {
 		if err != nil {
 			r.handleError(ErrorContext{
-				RemoteAddr: conn.RemoteAddr().String(),
+				RemoteAddr: remoteAddrOrDefault(conn.RemoteAddr()),
 				Hostport:   hostport,
 				Error:      err,
 			})
@@ -295,15 +296,25 @@ func (r *mitmProxyHandler) ServeSOCKS5(ctx context.Context, conn net.Conn) error
 	if hostport, err = r.handleSocks5Request(ctx, conn); err != nil {
 		return err
 	}
-	err = r.Serve(AppendToRequestContext(ctx, hostport, nil), conn)
-	return err
+	retErr := r.Serve(AppendToRequestContext(ctx, hostport, nil), conn)
+	return retErr
 }
 
-func (r *mitmProxyHandler) Serve(ctx context.Context, conn net.Conn) error {
+func (r *mitmProxyHandler) Serve(ctx context.Context, conn net.Conn) (err error) {
 	reqCtx, ok := FromRequestContext(ctx)
 	if !ok {
 		return ErrRequestContextMissing
 	}
+
+	defer func() {
+		if err != nil {
+			r.handleError(ErrorContext{
+				RemoteAddr: remoteAddrOrDefault(conn.RemoteAddr()),
+				Hostport:   reqCtx.Hostport,
+				Error:      err,
+			})
+		}
+	}()
 
 	nowTs := time.Now()
 
@@ -482,7 +493,7 @@ func (r *mitmProxyHandler) handleTunnelRequest(ctx context.Context, conn net.Con
 		bufConn := newBufConn(conn)
 		data, err = bufConn.Peek(6)
 		if err != nil {
-			return err
+			return fmt.Errorf("short buffer to peek: %s", err)
 		}
 		conn = bufConn
 	}
@@ -531,7 +542,7 @@ func (r *mitmProxyHandler) handleTunnelRequest(ctx context.Context, conn net.Con
 			default:
 				// tls handshake failed if GetConfigForClient() failed
 			}
-			return err
+			return fmt.Errorf("tls server handshake failed: %s", err)
 		}
 		// wait for tls handshake
 		dstConn = <-tlsConnCh
@@ -832,4 +843,11 @@ func getAddrPortFromConn(conn net.Conn) (addrport netip.AddrPort) {
 		addrport = netip.AddrPortFrom(addr, uint16(tcpAddr.Port))
 	}
 	return
+}
+
+func remoteAddrOrDefault(addr net.Addr) string {
+	if addr == nil {
+		return ""
+	}
+	return addr.String()
 }
