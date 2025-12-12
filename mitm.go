@@ -203,7 +203,7 @@ func NewMitmProxyHandler(opt ...Option) (MitmProxyHandler, error) {
 		priKeyPool:     newPriKeyPool(opts.certCachePool.Capacity),
 		clientCertPool: clientCertPool,
 		serverCertPool: newServerCertPool(opts.certCachePool.Capacity,
-			time.Duration(opts.certCachePool.Interval)*time.Millisecond,
+			time.Duration(opts.certCachePool.IntervalSecond)*time.Second,
 			time.Duration(opts.certCachePool.ExpireSecond)*time.Second,
 		),
 	}
