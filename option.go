@@ -8,6 +8,11 @@ import (
 	"github.com/josexy/mitmpgo/internal/cert"
 )
 
+type ClientCert struct {
+	CertPath string
+	KeyPath  string
+}
+
 type Option interface {
 	apply(*options)
 }
@@ -28,6 +33,8 @@ type options struct {
 	excludeHosts  []string    // Blacklist of hosts to exclude from interception (supports wildcards)
 	rootCAs       []string    // Paths to additional root CA certificate files
 	dialer        *net.Dialer // Custom dialer for outbound connections
+
+	clientCerts map[string]ClientCert // Client certificate configuration
 
 	// Certificate cache pool configuration
 	certCachePool struct {
@@ -141,6 +148,31 @@ func WithCAKeyPath(caKeyPath string) Option {
 func WithRootCAs(rootCAPaths ...string) Option {
 	return OptionFunc(func(o *options) {
 		o.rootCAs = rootCAPaths
+	})
+}
+
+// WithClientCert configures a client certificate for a specific hostname.
+// This certificate will be used for mTLS connections to the specified hostname.
+// See https://docs.mitmproxy.org/stable/concepts/certificates/#mutual-tls-mtls-and-client-certificates
+//
+// Example:
+//
+//	handler, err := NewMitmProxyHandler(
+//	    WithClientCert("example.com", ClientCert{
+//	        CertPath: "certs/client.crt",
+//	        KeyPath:  "certs/client.key",
+//	    }),
+//	    WithClientCert("api.example.com", ClientCert{
+//	        CertPath: "certs/api.crt",
+//	        KeyPath:  "certs/api.key",
+//	    }),
+//	)
+func WithClientCert(hostname string, clientCert ClientCert) Option {
+	return OptionFunc(func(o *options) {
+		if o.clientCerts == nil {
+			o.clientCerts = make(map[string]ClientCert)
+		}
+		o.clientCerts[hostname] = clientCert
 	})
 }
 

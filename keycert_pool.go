@@ -51,21 +51,21 @@ type certPool struct {
 	cache.Cache[string, tls.Certificate]
 }
 
-func newCertPool(maxCapacity int, checkInterval, certExpiredSecond time.Duration) *certPool {
+func newServerCertPool(maxCapacity int, checkInterval, certExpired time.Duration) *certPool {
 	if maxCapacity <= 0 {
 		maxCapacity = 100
 	}
 	if checkInterval <= 0 {
 		checkInterval = time.Second * 30
 	}
-	if certExpiredSecond <= 0 {
-		certExpiredSecond = time.Second * 15
+	if certExpired <= 0 {
+		certExpired = time.Second * 15
 	}
 	return &certPool{
 		Cache: cache.New[string, tls.Certificate](
 			cache.WithMaxSize(maxCapacity),
 			cache.WithInterval(checkInterval),
-			cache.WithExpiration(certExpiredSecond),
+			cache.WithExpiration(certExpired),
 			cache.WithBackgroundCheckCache(),
 			cache.WithUpdateCacheExpirationOnGet(),
 			// cache.WithDeleteExpiredCacheOnGet(),
