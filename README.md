@@ -157,7 +157,7 @@ mitmpgo.WithDisableProxy()
 mitmpgo.WithRootCAs("path/to/root-ca1.crt", "path/to/root-ca2.crt")
 
 // Configure certificate cache pool
-mitmpgo.WithCertCachePool(1000, 60000, 3600000)
+mitmpgo.WithCertCachePool(2048, 30, 15)
 
 // Custom dialer with timeout
 mitmpgo.WithDialer(&net.Dialer{
@@ -191,6 +191,9 @@ mitmpgo.WithErrorHandler(func(ec mitmpgo.ErrorContext) {
 ```go
 // Skip SSL verification when connecting to servers (not recommended for production)
 mitmpgo.WithSkipVerifySSLFromServer()
+
+// mTLS client-authentication
+mitmpgo.WithClientCert("example.com", mitmpgo.ClientCert{CertPath: "certs/client.crt", KeyPath: "certs/client.key" })
 ```
 
 ### Protocol Options

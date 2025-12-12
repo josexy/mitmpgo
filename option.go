@@ -8,6 +8,11 @@ import (
 	"github.com/josexy/mitmpgo/internal/cert"
 )
 
+type ClientCert struct {
+	CertPath string
+	KeyPath  string
+}
+
 type Option interface {
 	apply(*options)
 }
@@ -29,11 +34,13 @@ type options struct {
 	rootCAs       []string    // Paths to additional root CA certificate files
 	dialer        *net.Dialer // Custom dialer for outbound connections
 
+	clientCerts map[string]ClientCert // Client certificate configuration
+
 	// Certificate cache pool configuration
 	certCachePool struct {
-		Capacity     int // Maximum number of cached certificates
-		Interval     int // Cache cleanup interval in milliseconds
-		ExpireSecond int // Certificate cache expiration time in milliseconds
+		Capacity       int // Maximum number of cached certificates
+		IntervalSecond int // Cache cleanup interval in seconds
+		ExpireSecond   int // Certificate cache expiration time in seconds
 	}
 
 	rootCACertPool *x509.CertPool // System and custom root CA certificate pool
@@ -144,6 +151,31 @@ func WithRootCAs(rootCAPaths ...string) Option {
 	})
 }
 
+// WithClientCert configures a client certificate for a specific hostname.
+// This certificate will be used for mTLS connections to the specified hostname.
+// See https://docs.mitmproxy.org/stable/concepts/certificates/#mutual-tls-mtls-and-client-certificates
+//
+// Example:
+//
+//	handler, err := NewMitmProxyHandler(
+//	    WithClientCert("example.com", ClientCert{
+//	        CertPath: "certs/client.crt",
+//	        KeyPath:  "certs/client.key",
+//	    }),
+//	    WithClientCert("api.example.com", ClientCert{
+//	        CertPath: "certs/api.crt",
+//	        KeyPath:  "certs/api.key",
+//	    }),
+//	)
+func WithClientCert(hostname string, clientCert ClientCert) Option {
+	return OptionFunc(func(o *options) {
+		if o.clientCerts == nil {
+			o.clientCerts = make(map[string]ClientCert)
+		}
+		o.clientCerts[hostname] = clientCert
+	})
+}
+
 // WithDialer sets a custom dialer for establishing outbound connections.
 // This allows fine-grained control over connection behavior such as timeouts,
 // keep-alive settings, and local address binding.
@@ -203,9 +235,9 @@ func WithDisableHTTP2() Option {
 // for frequently accessed domains, which improves performance.
 //
 // Parameters:
-//   - capacity: Maximum number of certificates to cache (e.g., 1000)
-//   - interval: How often to run cache cleanup in milliseconds (e.g., 60000 for 1 minute)
-//   - expireSecond: How long certificates stay in cache in milliseconds (e.g., 3600000 for 1 hour)
+//   - capacity: Maximum number of certificates to cache (e.g., 2048). capacity must be a multiple of 256
+//   - interval: How often to run cache cleanup in milliseconds (e.g., 60 for 1 minute)
+//   - expireSecond: How long certificates stay in cache in milliseconds (e.g., 15 for 15 seconds)
 //
 // If not specified, default values are used.
 //
@@ -213,15 +245,15 @@ func WithDisableHTTP2() Option {
 //
 //	handler, err := NewMitmProxyHandler(
 //	    WithCertCachePool(
-//	        1000,    // Cache up to 1000 certificates
-//	        60000,   // Check for expired entries every 60 seconds
-//	        3600000, // Expire cached certificates after 1 hour
+//	        2048,    // Cache up to 2048 certificates
+//	        30,      // Background Check for expired entries every 30 seconds
+//	        15,      // Expire cached certificates after 15 seconds
 //	    ),
 //	)
-func WithCertCachePool(capacity, interval, expireSecond int) Option {
+func WithCertCachePool(capacity, intervalSecond, expireSecond int) Option {
 	return OptionFunc(func(o *options) {
 		o.certCachePool.Capacity = capacity
-		o.certCachePool.Interval = interval
+		o.certCachePool.IntervalSecond = intervalSecond
 		o.certCachePool.ExpireSecond = expireSecond
 	})
 }

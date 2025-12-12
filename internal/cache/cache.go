@@ -1,243 +1,275 @@
 package cache
 
 import (
-	"container/list"
 	"errors"
+	"fmt"
+	"hash/fnv"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 )
 
-var DefaultUpdateTimeTickInterval = time.Millisecond * 300
+const (
+	shardCount         = 256
+	shardMask          = shardCount - 1
+	cleanupSampleCount = 20
+)
 
 var (
 	ErrCacheIsNotFound = errors.New("cache is not found")
 	ErrCacheWasExpired = errors.New("cache was expired")
 )
 
+type Hasher[K comparable] func(K) uint64
+
+type EvictCallback func(any, any)
+
 type Cache[K comparable, V any] interface {
 	Get(K) (V, error)
 	Set(K, V)
 	Delete(K)
-	Contains(K) bool
 	Stop()
 }
 
-type EvictCallback func(any, any)
-
-type options struct {
-	timeNowFn           func() int64
-	maxSize             int
-	interval            time.Duration
-	expiration          time.Duration
-	evictFn             EvictCallback
-	checkCache          bool
-	updateCacheExpOnGet bool
-	deleteExpCacheOnGet bool
+type entry[K comparable, V any] struct {
+	key        K
+	value      V
+	expiresAt  int64 // nanoseconds
+	prev, next *entry[K, V]
 }
 
-type Option interface{ apply(*options) }
-
-type OptionFunc func(o *options)
-
-func (f OptionFunc) apply(o *options) { f(o) }
-
-func WithGoTimeNow() Option {
-	return OptionFunc(func(o *options) { o.timeNowFn = func() int64 { return time.Now().UnixNano() } })
+type cacheShard[K comparable, V any] struct {
+	sync.Mutex
+	items      map[K]*entry[K, V]
+	head, tail *entry[K, V]
+	capacity   int
+	evictFn    EvictCallback
 }
 
-func WithMaxSize(maxSize int) Option {
-	return OptionFunc(func(o *options) { o.maxSize = maxSize })
+type ShardedLRU[K comparable, V any] struct {
+	*options
+	nowUnixNano int64
+	hasher      Hasher[K]
+	closeCh     chan struct{}
+	shards      []*cacheShard[K, V]
 }
 
-func WithInterval(interval time.Duration) Option {
-	return OptionFunc(func(o *options) { o.interval = interval })
-}
+func New[K comparable, V any](hashFunc Hasher[K], opt ...Option) Cache[K, V] {
+	opts := newOptions(opt...)
 
-func WithExpiration(expiration time.Duration) Option {
-	return OptionFunc(func(o *options) { o.expiration = expiration })
-}
-
-func WithEvictCallback(fn EvictCallback) Option {
-	return OptionFunc(func(o *options) { o.evictFn = fn })
-}
-
-func WithUpdateCacheExpirationOnGet() Option {
-	return OptionFunc(func(o *options) { o.updateCacheExpOnGet = true })
-}
-
-func WithDeleteExpiredCacheOnGet() Option {
-	return OptionFunc(func(o *options) { o.deleteExpCacheOnGet = true })
-}
-
-func WithBackgroundCheckCache() Option {
-	return OptionFunc(func(o *options) { o.checkCache = true })
-}
-
-type cacheEntry[K comparable, V any] struct {
-	key     K
-	value   V
-	expires int64
-}
-
-var _ Cache[string, string] = (*LruCache[string, string])(nil)
-
-type LruCache[K comparable, V any] struct {
-	mu          sync.RWMutex
-	lru         *list.List
-	cache       map[K]*list.Element
-	doneCh      chan struct{}
-	opts        options
-	fasttimeNow int64
-}
-
-func New[K comparable, V any](opt ...Option) Cache[K, V] {
-	lc := &LruCache[K, V]{
-		lru:         list.New(),
-		cache:       make(map[K]*list.Element, 32),
-		doneCh:      make(chan struct{}, 1),
-		fasttimeNow: time.Now().UnixNano(),
-		opts: options{
-			maxSize:    100,
-			interval:   30 * time.Second,
-			expiration: 15 * time.Second,
-		},
+	if hashFunc == nil {
+		panic("hashFunc is required for sharded cache")
 	}
-	for _, o := range opt {
-		o.apply(&lc.opts)
+	if opts.capacity&shardMask != 0 {
+		panic(fmt.Errorf("capacity must be a multiple of %d", shardCount))
 	}
-	if lc.opts.checkCache {
-		go lc.check()
+
+	shardCap := opts.capacity / shardCount
+
+	c := &ShardedLRU[K, V]{
+		options:     opts,
+		hasher:      hashFunc,
+		nowUnixNano: time.Now().UnixNano(),
+		closeCh:     make(chan struct{}, 1),
+		shards:      make([]*cacheShard[K, V], shardCount),
+	}
+
+	for i := range shardCount {
+		c.shards[i] = newShard[K, V](shardCap, opts.evictFn)
+	}
+
+	if opts.bgCheckInterval > 0 {
+		go c.bgCleanup()
 	}
 	// use fast time instead of go time.Now()
-	if lc.opts.timeNowFn == nil {
-		lc.opts.timeNowFn = func() int64 { return atomic.LoadInt64(&lc.fasttimeNow) }
-		go lc.updateTick()
+	if opts.timeUnixNanoFn == nil {
+		opts.timeUnixNanoFn = func() int64 { return atomic.LoadInt64(&c.nowUnixNano) }
+		go c.updateTimeTicker()
 	}
-	return lc
+
+	return c
 }
 
-func (c *LruCache[K, V]) Contains(key K) bool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	_, ok := c.cache[key]
-	return ok
+func newShard[K comparable, V any](cap int, evictFn EvictCallback) *cacheShard[K, V] {
+	s := &cacheShard[K, V]{
+		items:    make(map[K]*entry[K, V], cap),
+		capacity: cap,
+		head:     &entry[K, V]{}, // Sentinel Head
+		tail:     &entry[K, V]{}, // Sentinel Tail
+		evictFn:  evictFn,
+	}
+	s.head.next = s.tail
+	s.tail.prev = s.head
+	return s
 }
 
-func (c *LruCache[K, V]) Get(key K) (value V, err error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if ele, ok := c.cache[key]; ok {
-		cache := ele.Value.(*cacheEntry[K, V])
-		now := c.opts.timeNowFn()
-		if now >= cache.expires {
-			// delete expired cache when get
-			if c.opts.deleteExpCacheOnGet {
-				c.delete(ele)
-			}
-			err = ErrCacheWasExpired
-			return
+func (c *ShardedLRU[K, V]) Get(key K) (V, error) {
+	hash := c.hasher(key)
+	shard := c.shards[hash&shardMask]
+
+	shard.Lock()
+	defer shard.Unlock()
+
+	entry, exists := shard.items[key]
+	if !exists {
+		var zero V
+		return zero, ErrCacheIsNotFound
+	}
+
+	timeNow := c.timeUnixNanoFn()
+	if entry.expiresAt > 0 && timeNow >= entry.expiresAt {
+		// delete expired cache when get
+		if c.deleteExpiredCacheOnGet {
+			shard.removeNode(entry)
 		}
-		c.lru.MoveToBack(ele)
-		// update cache expiration when get
-		if c.opts.updateCacheExpOnGet {
-			cache.expires = now + c.opts.expiration.Nanoseconds()
-		}
-		value = cache.value
+		var zero V
+		return zero, ErrCacheWasExpired
+	}
+
+	// update cache expiration when get
+	if c.updateCacheExpirationOnGet {
+		entry.expiresAt = timeNow + c.expiration.Nanoseconds()
+	}
+
+	shard.moveToHead(entry)
+
+	return entry.value, nil
+}
+
+func (c *ShardedLRU[K, V]) Set(key K, value V) {
+	hash := c.hasher(key)
+	shard := c.shards[hash&shardMask]
+
+	shard.Lock()
+	defer shard.Unlock()
+
+	node, exists := shard.items[key]
+	if exists {
+		node.value = value
+		node.expiresAt = c.timeUnixNanoFn() + c.expiration.Nanoseconds()
+		shard.moveToHead(node)
 		return
 	}
-	err = ErrCacheIsNotFound
-	return
+
+	newEntry := &entry[K, V]{
+		key:       key,
+		value:     value,
+		expiresAt: c.timeUnixNanoFn() + c.expiration.Nanoseconds(),
+	}
+
+	if len(shard.items) >= shard.capacity {
+		shard.removeOldest()
+	}
+
+	shard.items[key] = newEntry
+	shard.addToHead(newEntry)
 }
 
-func (c *LruCache[K, V]) Set(key K, value V) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if ele, ok := c.cache[key]; ok {
-		cache := ele.Value.(*cacheEntry[K, V])
-		cache.value = value
-		cache.expires = c.opts.timeNowFn() + c.opts.expiration.Nanoseconds()
-		c.lru.MoveToBack(ele)
-		return
-	}
-	if c.lru.Len() == c.opts.maxSize {
-		c.delete(c.lru.Front())
-	}
-	cache := &cacheEntry[K, V]{
-		key:     key,
-		value:   value,
-		expires: c.opts.timeNowFn() + c.opts.expiration.Nanoseconds(),
-	}
-	c.cache[key] = c.lru.PushBack(cache)
-}
+func (c *ShardedLRU[K, V]) Delete(key K) {
+	hash := c.hasher(key)
+	shard := c.shards[hash&shardMask]
 
-func (c *LruCache[K, V]) Delete(key K) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if ele, ok := c.cache[key]; ok {
-		c.delete(ele)
+	shard.Lock()
+	defer shard.Unlock()
+
+	if entry, exists := shard.items[key]; exists {
+		shard.removeNode(entry)
 	}
 }
 
-func (c *LruCache[K, V]) Stop() {
-	close(c.doneCh)
-}
-
-func (c *LruCache[K, V]) deleteOverflow() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for {
-		if c.lru.Len() > c.opts.maxSize {
-			c.delete(c.lru.Front())
-		}
-	}
-}
-
-func (c *LruCache[K, V]) delete(ele *list.Element) {
-	cache := ele.Value.(*cacheEntry[K, V])
-	delete(c.cache, cache.key)
-	c.lru.Remove(ele)
-	if c.opts.evictFn != nil {
-		c.opts.evictFn(cache.key, cache.value)
-	}
-}
-
-func (c *LruCache[K, V]) updateTick() {
-	ticker := time.NewTicker(DefaultUpdateTimeTickInterval)
+func (c *ShardedLRU[K, V]) updateTimeTicker() {
+	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		select {
-		case <-c.doneCh:
+		case <-c.closeCh:
 			return
 		case <-ticker.C:
-			atomic.StoreInt64(&c.fasttimeNow, time.Now().UnixNano())
+			atomic.StoreInt64(&c.nowUnixNano, time.Now().UnixNano())
 		}
 	}
 }
 
-func (c *LruCache[K, V]) check() {
-	interval := c.opts.interval
+func (c *ShardedLRU[K, V]) bgCleanup() {
+	interval := c.bgCheckInterval
 	timer := time.NewTimer(interval)
 	defer timer.Stop()
 	for {
 		select {
-		case <-c.doneCh:
+		case <-c.closeCh:
 			return
 		case <-timer.C:
-			c.cleanup()
+			c.cleanupCycle()
 			timer.Reset(interval)
 		}
 	}
 }
 
-func (c *LruCache[K, V]) cleanup() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	now := c.opts.timeNowFn()
-	for _, ele := range c.cache {
-		cache := ele.Value.(*cacheEntry[K, V])
-		if cache.expires <= now {
-			c.delete(ele)
+func (c *ShardedLRU[K, V]) cleanupCycle() {
+	timeNow := c.timeUnixNanoFn()
+
+	for _, shard := range c.shards {
+		shard.Lock()
+		cleanCount := 0
+		for _, entry := range shard.items {
+			if cleanCount >= cleanupSampleCount {
+				break
+			}
+			if entry.expiresAt > 0 && timeNow >= entry.expiresAt {
+				shard.removeNode(entry)
+			}
+			cleanCount++
 		}
+		shard.Unlock()
+
 	}
+}
+
+func (c *ShardedLRU[K, V]) Stop() {
+	close(c.closeCh)
+}
+
+func (s *cacheShard[K, V]) addToHead(n *entry[K, V]) {
+	n.prev = s.head
+	n.next = s.head.next
+	s.head.next.prev = n
+	s.head.next = n
+}
+
+func (s *cacheShard[K, V]) removeNode(n *entry[K, V]) {
+	n.prev.next = n.next
+	n.next.prev = n.prev
+	n.prev = nil // avoid memory leak
+	n.next = nil // avoid memory leak
+
+	delete(s.items, n.key)
+
+	if s.evictFn != nil {
+		s.evictFn(n.key, n.value)
+	}
+}
+
+func (s *cacheShard[K, V]) moveToHead(n *entry[K, V]) {
+	n.prev.next = n.next
+	n.next.prev = n.prev
+
+	s.addToHead(n)
+}
+
+func (s *cacheShard[K, V]) removeOldest() {
+	oldest := s.tail.prev
+	if oldest != s.head {
+		s.removeNode(oldest)
+	}
+}
+
+func StringHasher(s string) uint64 {
+	h := fnv.New64()
+	h.Write(unsafe.Slice(unsafe.StringData(s), len(s)))
+	return h.Sum64()
+}
+
+func NewStringCache[V any](opt ...Option) Cache[string, V] {
+	return New[string, V](StringHasher, opt...)
 }

@@ -76,7 +76,11 @@ func main() {
 		mitmpgo.WithHTTPInterceptor(httpInterceptor),
 		mitmpgo.WithWebsocketInterceptor(websocketInterceptor),
 		mitmpgo.WithErrorHandler(errHandler),
-		// mitmpgo.WithRootCAs("certs/other-ca.crt"),
+		// mitmpgo.WithClientCert("127.0.0.1", mitmpgo.ClientCert{
+		// 	CertPath: "certs/client.crt",
+		// 	KeyPath:  "certs/client.key",
+		// }),
+		// mitmpgo.WithRootCAs("certs/ca.crt"),
 		// mitmpgo.WithIncludeHosts("ifconfig.co", "*.example.com", "example.com", "*.bilibili.com"),
 		// mitmpgo.WithIncludeHosts("api.bilibili.com"),
 		// mitmpgo.WithExcludeHosts("www.baidu.com"),

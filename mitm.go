@@ -128,12 +128,13 @@ type MitmProxyHandler interface {
 
 type mitmProxyHandler struct {
 	*options
-	proxyDialer   *proxyDialer
-	priKeyPool    *priKeyPool
-	certPool      *certPool
-	h2s           *http2.Server
-	transport     *UnifiedTransport
-	domainMatcher struct {
+	proxyDialer    *proxyDialer
+	priKeyPool     *priKeyPool
+	serverCertPool *certPool
+	clientCertPool map[string]tls.Certificate
+	h2s            *http2.Server
+	transport      *UnifiedTransport
+	domainMatcher  struct {
 		include *trieNode
 		exclude *trieNode
 	}
@@ -145,6 +146,14 @@ func NewMitmProxyHandler(opt ...Option) (MitmProxyHandler, error) {
 	opts.caCert, err = cert.LoadCACertificate(opts.caCertPath, opts.caKeyPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load ca cert: %s", err)
+	}
+	clientCertPool := make(map[string]tls.Certificate, len(opts.clientCerts))
+	for hostname, cc := range opts.clientCerts {
+		tlsCert, err := tls.LoadX509KeyPair(cc.CertPath, cc.KeyPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load client cert: %s:%s %s", cc.CertPath, cc.KeyPath, err)
+		}
+		clientCertPool[hostname] = tlsCert
 	}
 	if len(opts.rootCAs) > 0 {
 		opts.rootCACertPool, err = x509.SystemCertPool()
@@ -189,12 +198,13 @@ func NewMitmProxyHandler(opt ...Option) (MitmProxyHandler, error) {
 			ReadIdleTimeout:  time.Second * 20,
 			WriteByteTimeout: time.Second * 30,
 		},
-		transport:   NewTransport(dialFn),
-		proxyDialer: NewProxyDialer(proxyURL, opts.dialer),
-		priKeyPool:  newPriKeyPool(opts.certCachePool.Capacity),
-		certPool: newCertPool(opts.certCachePool.Capacity,
-			time.Duration(opts.certCachePool.Interval)*time.Millisecond,
-			time.Duration(opts.certCachePool.ExpireSecond)*time.Millisecond,
+		transport:      NewTransport(dialFn),
+		proxyDialer:    NewProxyDialer(proxyURL, opts.dialer),
+		priKeyPool:     newPriKeyPool(opts.certCachePool.Capacity),
+		clientCertPool: clientCertPool,
+		serverCertPool: newServerCertPool(opts.certCachePool.Capacity,
+			time.Duration(opts.certCachePool.IntervalSecond)*time.Second,
+			time.Duration(opts.certCachePool.ExpireSecond)*time.Second,
 		),
 	}
 	handler.domainMatcher.include = includeMatcher
@@ -399,10 +409,15 @@ func (r *mitmProxyHandler) initiateSSLHandshakeWithClientHello(ctx context.Conte
 		CipherSuites: chi.CipherSuites,
 		RootCAs:      r.rootCACertPool,
 	}
+	if len(r.clientCertPool) > 0 {
+		if clientCert, ok := r.clientCertPool[host]; ok {
+			// mTLS client-authentication
+			tlsConfig.Certificates = []tls.Certificate{clientCert}
+		}
+	}
+	tlsConfig.ServerName = serverName
 	if r.skipVerifySSL {
 		tlsConfig.InsecureSkipVerify = true
-	} else if serverName != "" {
-		tlsConfig.ServerName = serverName
 	}
 	tlsClientConn := tls.Client(dstConn, tlsConfig)
 	// send client hello and do tls handshake
@@ -413,7 +428,7 @@ func (r *mitmProxyHandler) initiateSSLHandshakeWithClientHello(ctx context.Conte
 	cs := tlsClientConn.ConnectionState()
 
 	// Get server certificate from local cache pool
-	if serverCert, err := r.certPool.Get(host); err == nil {
+	if serverCert, err := r.serverCertPool.Get(host); err == nil {
 		return tlsClientConn, &tls.Config{
 			// Server selected negotiated protocol
 			NextProtos:   []string{cs.NegotiatedProtocol},
@@ -470,7 +485,7 @@ func (r *mitmProxyHandler) initiateSSLHandshakeWithClientHello(ctx context.Conte
 	})
 
 	certificate := serverCert.Certificate()
-	r.certPool.Set(host, certificate)
+	r.serverCertPool.Set(host, certificate)
 	return tlsClientConn, &tls.Config{
 		// Server selected negotiated protocol
 		NextProtos:   []string{cs.NegotiatedProtocol},
