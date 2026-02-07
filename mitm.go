@@ -426,6 +426,10 @@ func (r *mitmProxyHandler) initiateSSLHandshakeWithClientHello(ctx context.Conte
 	}
 	tlsConnEstTs := time.Now()
 	cs := tlsClientConn.ConnectionState()
+	if cs.NegotiatedProtocol == "" {
+		// fallback to http/1.1 if the server doesn't support ALPN or doesn't return the negotiated protocol
+		cs.NegotiatedProtocol = "http/1.1"
+	}
 
 	// Get server certificate from local cache pool
 	if serverCert, err := r.serverCertPool.Get(host); err == nil {
