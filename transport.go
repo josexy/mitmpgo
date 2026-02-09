@@ -35,13 +35,15 @@ func NewTransport(dialFn func(ctx context.Context, network, addr string) (net.Co
 			DialContext:           dialFn,
 			DialTLSContext:        dialFn,
 			ForceAttemptHTTP2:     true,
+			DisableCompression:    true,
 		},
 		h2cTransport: &http2.Transport{
-			AllowHTTP:        true,
-			IdleConnTimeout:  time.Second * 60,
-			PingTimeout:      time.Second * 15,
-			ReadIdleTimeout:  time.Second * 20,
-			WriteByteTimeout: time.Second * 30,
+			AllowHTTP:          true,
+			DisableCompression: true,
+			IdleConnTimeout:    time.Second * 60,
+			PingTimeout:        time.Second * 15,
+			ReadIdleTimeout:    time.Second * 20,
+			WriteByteTimeout:   time.Second * 30,
 			DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
 				return dialFn(ctx, network, addr)
 			},
