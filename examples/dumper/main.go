@@ -1,16 +1,18 @@
 package main
 
 import (
+	"bytes"
+	"compress/flate"
+	"compress/gzip"
+	"compress/zlib"
 	"context"
 	"crypto/tls"
-	"encoding/hex"
 	"flag"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
-	"net/http/httputil"
 	"os"
 	"os/signal"
 	"strings"
@@ -22,15 +24,68 @@ import (
 	"github.com/josexy/mitmpgo/metadata"
 )
 
-type chunkBodyReader struct {
-	io.ReadCloser
-	N int64
+const CHUNK_SIZE = 512
+
+const (
+	CHUNK_TYPE_REQ = 1 << iota
+	CHUNK_TYPE_RSP
+)
+
+type bodyDecoder struct {
+	reader io.ReadCloser
+	pw     *io.PipeWriter
 }
 
-func newChunkBodyReader(r io.ReadCloser, chunkBodySize int64) *chunkBodyReader {
+func newBodyDecoder(r io.ReadCloser, encoding string, chunkType int) (io.ReadCloser, error) {
+	if encoding == "" {
+		return newChunkBodyReader(r, CHUNK_SIZE, chunkType), nil
+	}
+
+	pr, pw := io.Pipe()
+	teeReader := io.TeeReader(r, pw)
+	go func() {
+		decodedReader, err := getDecodedReader(pr, encoding)
+		if err != nil {
+			// if the decoder creation fails, we need to read pr to avoid pw blocking
+			io.Copy(io.Discard, pr)
+			return
+		}
+		decodedReader = newChunkBodyReader(decodedReader, CHUNK_SIZE, chunkType)
+		defer decodedReader.Close()
+		// need to read all data to avoid pw blocking, but we don't care about the decoded data here, so just discard it
+		io.Copy(io.Discard, decodedReader)
+	}()
+	return &bodyDecoder{
+		reader: io.NopCloser(teeReader),
+		pw:     pw,
+	}, nil
+}
+
+func (b *bodyDecoder) Close() error {
+	return b.reader.Close()
+}
+
+func (b *bodyDecoder) Read(p []byte) (n int, err error) {
+	n, err = b.reader.Read(p)
+	if err == io.EOF {
+		// when reader is closed or reaches EOF, we should also close the pipe writer to avoid goroutine leak
+		b.pw.CloseWithError(err)
+	}
+	return
+}
+
+type chunkBodyReader struct {
+	io.ReadCloser
+	N         int64
+	buf       bytes.Buffer // or use buf pool?
+	chunkType int
+}
+
+func newChunkBodyReader(r io.ReadCloser, chunkBodySize int64, chunkType int) io.ReadCloser {
 	return &chunkBodyReader{
 		N:          chunkBodySize,
 		ReadCloser: r,
+		chunkType:  chunkType,
 	}
 }
 
@@ -43,7 +98,11 @@ func (r *chunkBodyReader) Read(p []byte) (n int, err error) {
 	}
 	n, err = r.ReadCloser.Read(p)
 	if n > 0 {
-		fmt.Printf("--> hex dump(chunk size/data size: %d/%d):\n%s\n", r.N, n, hex.Dump(p[:n]))
+		r.buf.Write(p[:n])
+		// fmt.Printf("--> hex dump(chunk size/data size: %d/%d):\n%s\n", r.N, n, hex.Dump(p[:n]))
+	}
+	if err == io.EOF {
+		fmt.Printf("<<-- [%d]full data dump (%d bytes):\n%s\n", r.chunkType, r.buf.Len(), r.buf.Bytes())
 	}
 	return
 }
@@ -178,12 +237,7 @@ func httpInterceptor(ctx context.Context, req *http.Request, invoker mitmpgo.HTT
 		)
 	}
 
-	if md.StreamBody {
-		req.Body = newChunkBodyReader(req.Body, 512)
-	} else {
-		data, _ := httputil.DumpRequest(req, true)
-		fmt.Println("request:", string(data))
-	}
+	req.Body, _ = newBodyDecoder(req.Body, "", CHUNK_TYPE_REQ)
 
 	rsp, err := invoker.Invoke(req)
 	if err != nil {
@@ -198,12 +252,7 @@ func httpInterceptor(ctx context.Context, req *http.Request, invoker mitmpgo.HTT
 		slog.String("protocol", rsp.Proto),
 	)
 
-	if md.StreamBody {
-		rsp.Body = newChunkBodyReader(rsp.Body, 512)
-	} else {
-		data, _ := httputil.DumpResponse(rsp, true)
-		fmt.Println("response:", string(data))
-	}
+	rsp.Body, err = newBodyDecoder(rsp.Body, rsp.Header.Get("Content-Encoding"), CHUNK_TYPE_RSP)
 
 	return rsp, err
 }
@@ -247,4 +296,19 @@ func websocketInterceptor(ctx context.Context, dir mitmpgo.WSDirection, msgType 
 	// 	b.WriteString(time.Now().String())
 	// }
 	return wdi.Invoke(msgType, b)
+}
+
+func getDecodedReader(r io.Reader, encoding string) (io.ReadCloser, error) {
+	switch encoding {
+	case "gzip":
+		return gzip.NewReader(r)
+	case "deflate":
+		zr, err := zlib.NewReader(r)
+		if err != nil {
+			return io.NopCloser(flate.NewReader(r)), nil
+		}
+		return zr, nil
+	default: // other encodings...
+		return io.NopCloser(r), nil
+	}
 }
