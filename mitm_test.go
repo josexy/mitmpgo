@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"strings"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -18,13 +18,22 @@ import (
 	"golang.org/x/net/http2/h2c"
 )
 
-const (
-	certdir        = "/tmp/cert"
-	mitmCertPath   = "/tmp/cert/ca.crt"
-	mitmKeyPath    = "/tmp/cert/ca.key"
-	serverCertPath = "/tmp/cert/server.crt"
-	serverKeyPath  = "/tmp/cert/server.key"
+var (
+	certdir        = "cert"
+	mitmCertPath   = "cert/ca.crt"
+	mitmKeyPath    = "cert/ca.key"
+	serverCertPath = "cert/server.crt"
+	serverKeyPath  = "cert/server.key"
 )
+
+func initCertPath() {
+	tmpDir := os.TempDir()
+	certdir = filepath.Join(tmpDir, certdir)
+	mitmCertPath = filepath.Join(tmpDir, mitmCertPath)
+	mitmKeyPath = filepath.Join(tmpDir, mitmKeyPath)
+	serverCertPath = filepath.Join(tmpDir, serverCertPath)
+	serverKeyPath = filepath.Join(tmpDir, serverKeyPath)
+}
 
 func startSimpleHttpServer(t *testing.T) func() {
 	certificate, err := tls.LoadX509KeyPair(serverCertPath, serverKeyPath)
@@ -93,16 +102,43 @@ func startSimpleHttpServer(t *testing.T) func() {
 	}
 }
 
-func testHTTPRequest(proxyAddr, targetAddr string) (statusCode int, proto string, err error) {
-	transport := &http.Transport{
-		ForceAttemptHTTP2: true,
-		Proxy: func(r *http.Request) (*url.URL, error) {
-			return url.Parse(proxyAddr)
+func testHTTPRequest(typ, proxyAddr, targetAddr string) (statusCode int, proto string, err error) {
+	u, err := url.Parse(proxyAddr)
+	if err != nil {
+		return
+	}
+	u2, err := url.Parse(targetAddr)
+	if err != nil {
+		return
+	}
+	proxyDialer := mitmpgo.NewProxyDialer(u, nil)
+	conn, err := proxyDialer.Dial("tcp", u2.Host)
+	if err != nil {
+		return
+	}
+	var transport http.RoundTripper
+	transport = &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return conn, nil
 		},
 	}
-	if strings.Contains(targetAddr, "https://") {
-		transport.TLSClientConfig = &tls.Config{
-			InsecureSkipVerify: true,
+	if typ == "h2" || typ == "https" {
+		transport = &http.Transport{
+			ForceAttemptHTTP2: true,
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+			},
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return conn, nil
+			},
+		}
+	}
+	if typ == "h2c" {
+		transport = &http2.Transport{
+			AllowHTTP: true,
+			DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
+				return conn, nil
+			},
 		}
 	}
 	client := &http.Client{
@@ -113,6 +149,7 @@ func testHTTPRequest(proxyAddr, targetAddr string) (statusCode int, proto string
 		return
 	}
 	defer rsp.Body.Close()
+	conn.Close()
 	return rsp.StatusCode, rsp.Proto, nil
 }
 
@@ -166,6 +203,7 @@ func startmitmpgo(t *testing.T, interceptor mitmpgo.HTTPInterceptor) mitmpgo.Mit
 }
 
 func TestMitmProxyHandler(t *testing.T) {
+	initCertPath()
 	genCACertAndKey()
 	genServerCertAndKey()
 	defer os.RemoveAll(certdir)
@@ -183,26 +221,27 @@ func TestMitmProxyHandler(t *testing.T) {
 	time.Sleep(time.Second * 1)
 
 	tests := []struct {
+		typ        string
 		proto      string
 		addr       string
 		statusCode int
 	}{
-		{"HTTP/1.1", "http://127.0.0.1:9090", 200},
-		{"HTTP/2.0", "https://127.0.0.1:9091", 200},
-		{"HTTP/1.1", "http://127.0.0.1:9092", 200},
-		{"HTTP/1.1", "https://127.0.0.1:9093", 200},
+		{"http/1.1", "HTTP/1.1", "http://127.0.0.1:9090", 200},
+		{"h2", "HTTP/2.0", "https://127.0.0.1:9091", 200},
+		{"h2c", "HTTP/2.0", "http://127.0.0.1:9092", 200},
+		{"https", "HTTP/1.1", "https://127.0.0.1:9093", 200},
 	}
 
 	for _, test := range tests {
-		statusCode, proto, err := testHTTPRequest(proxyAddr, test.addr)
+		statusCode, proto, err := testHTTPRequest(test.typ, proxyAddr, test.addr)
 		if err != nil {
 			t.Error(err)
 		}
 		if statusCode != test.statusCode {
-			t.Errorf("statusCode: %d, want: %d", statusCode, test.statusCode)
+			t.Errorf("type: %s, statusCode: %d, want: %d", test.typ, statusCode, test.statusCode)
 		}
 		if proto != test.proto {
-			t.Errorf("proto: %s, want: %s", proto, test.proto)
+			t.Errorf("type: %s, proto: %s, want: %s", test.typ, proto, test.proto)
 		}
 	}
 
