@@ -88,12 +88,20 @@ handler, err := mitmpgo.NewMitmProxyHandler(
 ### With WebSocket Interceptor
 
 ```go
-websocketInterceptor := func(ctx context.Context, dir metadata.WSDirection, msgType int, b *buf.Buffer, req *http.Request, invoker mitmpgo.WebsocketDelegatedInvoker) error {
+websocketInterceptor := func(ctx context.Context, req *http.Request, rsp *http.Response, fw mitmpgo.WebsocketFramesWatcher) {
     // Log WebSocket messages
-    fmt.Printf("WS [%s] %s: %d bytes\n", dir, req.URL, b.Len())
+    log.Printf("WS url: %s", req.URL.String())
 
-    // Forward the message
-    return invoker.Invoke(msgType, b)
+    for frame := range fw.GetFrame() {
+        dir := frame.Direction()
+        msgType := frame.MessageType()
+        dataBuf := frame.DataBuffer()
+        log.Printf("---> %s %d %s", dir, msgType, dataBuf.String())
+        if err := frame.Invoke(); err != nil {
+            log.Printf("frame invoke error: %v", err)
+        }
+        frame.Release()
+    }
 }
 
 handler, err := mitmpgo.NewMitmProxyHandler(
@@ -163,6 +171,9 @@ mitmpgo.WithCertCachePool(2048, 30, 15)
 mitmpgo.WithDialer(&net.Dialer{
     Timeout: 30 * time.Second,
 })
+
+// Maximum channel size of WebSocket frames
+mitmpgo.WithMaxWebsocketFramesPerForward(4096)
 ```
 
 ### Interceptor Options
@@ -176,9 +187,6 @@ mitmpgo.WithWebsocketInterceptor(websocketInterceptor)
 
 // Chain multiple HTTP interceptors (executed in order)
 mitmpgo.WithChainHTTPInterceptor(interceptor1, interceptor2, interceptor3)
-
-// Chain multiple WebSocket interceptors (executed in order)
-mitmpgo.WithChainWebsocketInterceptor(wsInterceptor1, wsInterceptor2)
 
 // Set error handler
 mitmpgo.WithErrorHandler(func(ec mitmpgo.ErrorContext) {

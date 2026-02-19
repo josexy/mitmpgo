@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httputil"
 	"os"
 	"os/signal"
 	"strings"
@@ -20,7 +21,6 @@ import (
 	"time"
 
 	"github.com/josexy/mitmpgo"
-	"github.com/josexy/mitmpgo/buf"
 	"github.com/josexy/mitmpgo/metadata"
 )
 
@@ -37,6 +37,9 @@ type bodyDecoder struct {
 }
 
 func newBodyDecoder(r io.ReadCloser, encoding string, chunkType int) (io.ReadCloser, error) {
+	if r == http.NoBody { // no body and no need to replace it
+		return r, nil
+	}
 	if encoding == "" {
 		return newChunkBodyReader(r, CHUNK_SIZE, chunkType), nil
 	}
@@ -102,7 +105,7 @@ func (r *chunkBodyReader) Read(p []byte) (n int, err error) {
 		// fmt.Printf("--> hex dump(chunk size/data size: %d/%d):\n%s\n", r.N, n, hex.Dump(p[:n]))
 	}
 	if err == io.EOF {
-		fmt.Printf("<<-- [%d]full data dump (%d bytes):\n%s\n", r.chunkType, r.buf.Len(), r.buf.Bytes())
+		fmt.Printf("<<-- [%d]full data dump (%d bytes):\n", r.chunkType, r.buf.Len())
 	}
 	return
 }
@@ -147,6 +150,7 @@ func main() {
 		// mitmpgo.WithDisableProxy(),
 		// mitmpgo.WithDisableHTTP2(),
 		// mitmpgo.WithSkipVerifySSLFromServer(),
+		// mitmpgo.WithMaxWebsocketFramesPerForward(4096),
 	)
 	if err != nil {
 		panic(err)
@@ -207,7 +211,6 @@ func httpInterceptor(ctx context.Context, req *http.Request, invoker mitmpgo.HTT
 		slog.String("host", req.Host),
 		slog.String("proto", req.Proto),
 		slog.String("method", req.Method),
-		slog.Bool("tls", req.TLS != nil),
 		slog.String("url", req.URL.String()),
 		slog.Any("headers", map[string][]string(req.Header)),
 	)
@@ -257,17 +260,28 @@ func httpInterceptor(ctx context.Context, req *http.Request, invoker mitmpgo.HTT
 	return rsp, err
 }
 
-func websocketInterceptor(ctx context.Context, dir mitmpgo.WSDirection, msgType int, b *buf.Buffer, req *http.Request, wdi mitmpgo.WebsocketDelegatedInvoker) error {
+func websocketInterceptor(ctx context.Context, req *http.Request, rsp *http.Response, fw mitmpgo.WebsocketFramesWatcher) {
 	_md, _ := metadata.FromContext(ctx)
 	md := _md.MD()
-	slog.Debug("websocket",
+	slog.Debug("request",
+		slog.Bool("stream_body", md.StreamBody),
 		slog.String("source", md.SourceAddr.String()),
 		slog.String("destination", md.DestinationAddr.String()),
 		slog.String("hostport", md.RequestHostport),
-		slog.String("uri", req.URL.String()),
-		slog.String("direction", dir.String()),
-		slog.Int("msg_type", msgType),
+		slog.String("host", req.Host),
+		slog.String("proto", req.Proto),
+		slog.String("method", req.Method),
+		slog.String("url", req.URL.String()),
+		slog.Int("status_code", rsp.StatusCode),
+		slog.Any("request_headers", map[string][]string(req.Header)),
+		slog.Any("response_headers", map[string][]string(rsp.Header)),
 	)
+
+	data, _ := httputil.DumpRequest(req, false)
+	fmt.Printf("%s\n", string(data))
+	data, _ = httputil.DumpResponse(rsp, false)
+	fmt.Printf("%s\n", string(data))
+
 	if md.TLSState != nil {
 		slog.Debug("tls state",
 			slog.String("server_name", md.TLSState.ServerName),
@@ -292,10 +306,25 @@ func websocketInterceptor(ctx context.Context, dir mitmpgo.WSDirection, msgType 
 			slog.Any("ip", md.ServerCertificate.IPAddresses),
 		)
 	}
-	// if md.Direction == metadata.Receive {
-	// 	b.WriteString(time.Now().String())
-	// }
-	return wdi.Invoke(msgType, b)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case frame, ok := <-fw.GetFrame():
+			if !ok {
+				return
+			}
+			dir := frame.Direction()
+			msgType := frame.MessageType()
+			dataBuf := frame.DataBuffer()
+			fmt.Printf("---> %s %d %s\n", dir, msgType, dataBuf.String())
+			if err := frame.Invoke(); err != nil {
+				slog.Error("frame invoke error", slog.String("error", err.Error()))
+			}
+			frame.Release()
+		}
+	}
 }
 
 func getDecodedReader(r io.Reader, encoding string) (io.ReadCloser, error) {

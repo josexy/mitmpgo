@@ -5,8 +5,8 @@ import (
 	"io"
 	"net"
 
-	"github.com/gorilla/websocket"
 	"github.com/josexy/mitmpgo/buf"
+	"github.com/josexy/websocket"
 )
 
 type bufConn struct {

@@ -34,6 +34,8 @@ type options struct {
 	rootCAs       []string    // Paths to additional root CA certificate files
 	dialer        *net.Dialer // Custom dialer for outbound connections
 
+	wsMaxFramesPerForward int // Max frames channel size per single websocket forward
+
 	clientCerts map[string]ClientCert // Client certificate configuration
 
 	// Certificate cache pool configuration
@@ -50,14 +52,14 @@ type options struct {
 	httpInt       HTTPInterceptor
 	wsInt         WebsocketInterceptor
 	chainHttpInts []HTTPInterceptor
-	chainWsInts   []WebsocketInterceptor
 }
 
 // newOptions creates a new options instance with default values.
 // Default dialer timeout is 15 seconds.
 func newOptions(opt ...Option) *options {
 	options := &options{
-		dialer: &net.Dialer{Timeout: 15 * time.Second},
+		dialer:                &net.Dialer{Timeout: 15 * time.Second},
+		wsMaxFramesPerForward: 2048,
 	}
 	for _, o := range opt {
 		o.apply(options)
@@ -258,6 +260,22 @@ func WithCertCachePool(capacity, intervalSecond, expireSecond int) Option {
 	})
 }
 
+// WithMaxWebsocketFramesPerForward specifies the maximum channel size of frames that can be buffered
+// per single websocket forward.
+//
+// If not specified, default value(2048) is used.
+//
+// Example:
+//
+//	handler, err := NewMitmProxyHandler(
+//	    WithMaxWebsocketFramesPerForward(2048),
+//	)
+func WithMaxWebsocketFramesPerForward(maxFrames int) Option {
+	return OptionFunc(func(o *options) {
+		o.wsMaxFramesPerForward = maxFrames
+	})
+}
+
 // WithIncludeHosts specifies a whitelist of hosts that should be intercepted.
 // Only traffic to these hosts will be intercepted; all other traffic will pass through
 // without interception (passthrough mode).
@@ -434,34 +452,5 @@ func WithWebsocketInterceptor(interceptor WebsocketInterceptor) Option {
 func WithChainHTTPInterceptor(interceptors ...HTTPInterceptor) Option {
 	return OptionFunc(func(o *options) {
 		o.chainHttpInts = append(o.chainHttpInts, interceptors...)
-	})
-}
-
-// WithChainWebsocketInterceptor chains multiple WebSocket interceptors together.
-// Interceptors are executed in the order they are provided, forming a middleware chain.
-// Each interceptor can inspect/modify the WebSocket message, call the next interceptor,
-// and handle the message forwarding. And The final interceptor will forwards the message.
-//
-// Example:
-//
-//	loggingInterceptor := func(ctx context.Context, dir metadata.WSDirection, msgType int, data *buf.Buffer, req *http.Request, invoker WebsocketDelegatedInvoker) error {
-//	    log.Printf("[%s] Message: type=%d, size=%d", dir, msgType, data.Len())
-//	    return invoker.Invoke(msgType, data)
-//	}
-//
-//	filterInterceptor := func(ctx context.Context, dir metadata.WSDirection, msgType int, data *buf.Buffer, req *http.Request, invoker WebsocketDelegatedInvoker) error {
-//	    // Drop ping messages
-//	    if msgType == websocket.PingMessage {
-//	        return nil
-//	    }
-//	    return invoker.Invoke(msgType, data)
-//	}
-//
-//	handler, err := NewMitmProxyHandler(
-//	    WithChainWebsocketInterceptor(loggingInterceptor, filterInterceptor),
-//	)
-func WithChainWebsocketInterceptor(interceptors ...WebsocketInterceptor) Option {
-	return OptionFunc(func(o *options) {
-		o.chainWsInts = append(o.chainWsInts, interceptors...)
 	})
 }

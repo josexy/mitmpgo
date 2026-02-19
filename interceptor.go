@@ -28,6 +28,17 @@ func (d WSDirection) String() string {
 	}
 }
 
+type WsFrame interface {
+	Direction() WSDirection
+	MessageType() int
+	DataBuffer() *buf.Buffer
+
+	// Forward the websocket message and release the data buffer
+	Invoke() error
+	// MUST be called to release the data buffer
+	Release()
+}
+
 type (
 	HTTPDelegatedInvoker interface {
 		Invoke(request *http.Request) (*http.Response, error)
@@ -36,6 +47,9 @@ type (
 	WebsocketDelegatedInvoker interface {
 		Invoke(msgType int, dataPtr *buf.Buffer) error
 	}
+	WebsocketFramesWatcher interface {
+		GetFrame() <-chan WsFrame
+	}
 )
 
 type (
@@ -43,7 +57,7 @@ type (
 	WebsocketDelegatedInvokerFunc func(int, *buf.Buffer) error
 
 	HTTPInterceptor      func(context.Context, *http.Request, HTTPDelegatedInvoker) (*http.Response, error)
-	WebsocketInterceptor func(context.Context, WSDirection, int, *buf.Buffer, *http.Request, WebsocketDelegatedInvoker) error
+	WebsocketInterceptor func(context.Context, *http.Request, *http.Response, WebsocketFramesWatcher)
 )
 
 func (f HTTPDelegatedInvokerFunc) Invoke(r *http.Request) (*http.Response, error) { return f(r) }
@@ -67,20 +81,5 @@ func getChainHTTPInterceptor(interceptors []HTTPInterceptor, curr int, ctx conte
 	}
 	return HTTPDelegatedInvokerFunc(func(r *http.Request) (*http.Response, error) {
 		return interceptors[curr+1](ctx, r, getChainHTTPInterceptor(interceptors, curr+1, ctx, finalInvoker))
-	})
-}
-
-func chainWebsocketInterceptors(interceptors []WebsocketInterceptor) WebsocketInterceptor {
-	return func(ctx context.Context, d WSDirection, i int, b *buf.Buffer, r *http.Request, wdi WebsocketDelegatedInvoker) error {
-		return interceptors[0](ctx, d, i, b, r, getChainWebsocketInterceptor(interceptors, 0, ctx, d, r, wdi))
-	}
-}
-
-func getChainWebsocketInterceptor(interceptors []WebsocketInterceptor, curr int, ctx context.Context, dir WSDirection, req *http.Request, finalInvoker WebsocketDelegatedInvoker) WebsocketDelegatedInvoker {
-	if curr == len(interceptors)-1 {
-		return finalInvoker
-	}
-	return WebsocketDelegatedInvokerFunc(func(i int, b *buf.Buffer) error {
-		return interceptors[curr+1](ctx, dir, i, b, req, getChainWebsocketInterceptor(interceptors, curr+1, ctx, dir, req, finalInvoker))
 	})
 }

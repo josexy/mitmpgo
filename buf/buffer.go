@@ -339,6 +339,9 @@ func (b *Buffer) String() string {
 	if b == nil {
 		return "<nil>"
 	}
+	if b.Len() == 0 {
+		return ""
+	}
 	return unsafe.String(&b.Bytes()[0], b.Len())
 }
 
