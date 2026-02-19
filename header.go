@@ -49,6 +49,13 @@ var (
 	}
 )
 
+func removeProxyHeaders(header http.Header) {
+	header.Del(HttpHeaderProxyAuthenticate)
+	header.Del(HttpHeaderProxyAuthorization)
+	header.Del(HttpHeaderProxyConnection)
+	header.Del(HttpHeaderProxyAgent)
+}
+
 func removeHopByHopRequestHeaders(header http.Header) {
 	for _, h := range hopByHopHeaders {
 		header.Del(h)

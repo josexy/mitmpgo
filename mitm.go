@@ -187,10 +187,10 @@ func NewMitmProxyHandler(opt ...Option) (MitmProxyHandler, error) {
 	}
 
 	dialFn := func(ctx context.Context, network, addr string) (net.Conn, error) {
-		if preboundConn, ok := ctx.Value(connContextKey).(net.Conn); ok {
-			return preboundConn, nil
+		if conn, ok := ctx.Value(connContextKey).(net.Conn); ok {
+			return conn, nil
 		}
-		return nil, errors.New("no prebound connection")
+		return nil, errors.New("connContextKey missing in context")
 	}
 
 	includeMatcher, excludeMatcher := newTrieNode(), newTrieNode()
@@ -612,12 +612,11 @@ func (r *mitmProxyHandler) handleH2CRequest(ctx context.Context, rw http.Respons
 	}
 	// Handle Upgrade to h2c (RFC 7540 Section 3.2)
 	if isH2CUpgrade(req.Header) {
-		removeHopByHopRequestHeaders(req.Header)
+		removeProxyHeaders(req.Header)
 		conn, settings, err := upgradeH2C(rw, req)
 		if err != nil {
 			return false, err
 		}
-		req.Header.Del(HttpHeaderHttp2Settings)
 		ctx = context.WithValue(ctx, connContextKey, dstConn)
 		r.h2s.ServeConn(conn, &http2.ServeConnOpts{
 			Context:        ctx,
@@ -674,6 +673,7 @@ func (r *mitmProxyHandler) distinguishHTTPRequest(ctx context.Context, srcConn, 
 		}
 	}
 
+	removeProxyHeaders(request.Header)
 	// patch the new request to the request context
 	reqCtx.Request = request
 	newCtx = AppendToRequestContext(ctx, reqCtx.Hostport, reqCtx.Request, false)
@@ -797,7 +797,7 @@ func (r *mitmProxyHandler) relayConnForWS(ctx context.Context, srcConn, dstConn 
 func (r *mitmProxyHandler) relayConnForHTTP(ctx context.Context, srcConn, dstConn net.Conn) (err error) {
 	reqCtx, _ := FromRequestContext(ctx)
 	// set to request context
-	reqCtx.Request = reqCtx.Request.WithContext(context.WithValue(ctx, connContextKey, dstConn))
+	ctx = context.WithValue(ctx, connContextKey, dstConn)
 
 	response, err := r.roundTripWithContext(ctx, reqCtx.Request)
 	if err != nil {
@@ -809,6 +809,8 @@ func (r *mitmProxyHandler) relayConnForHTTP(ctx context.Context, srcConn, dstCon
 }
 
 func (r *mitmProxyHandler) roundTripWithContext(ctx context.Context, req *http.Request) (response *http.Response, err error) {
+	conn, _ := ctx.Value(connContextKey).(net.Conn)
+	req = req.WithContext(context.WithValue(req.Context(), connContextKey, conn))
 	// Only one http interceptor will be invoked
 	if r.httpInt != nil {
 		response, err = r.httpInt(ctx, req, HTTPDelegatedInvokerFunc(r.transport.RoundTrip))
@@ -843,13 +845,20 @@ func (r *mitmProxyHandler) serveHTTP2Handler(ctx context.Context) http.Handler {
 			}
 		*/
 		if req.URL.Scheme == "" {
-			req.URL.Scheme = "https"
+			if req.TLS != nil {
+				req.URL.Scheme = "https"
+			} else {
+				req.URL.Scheme = "http"
+			}
 		}
 		if req.URL.Host == "" {
 			req.URL.Host = req.Host
 		}
 		// the request body size may be zero
 		if req.ContentLength == 0 {
+			if req.Body != nil {
+				req.Body.Close()
+			}
 			req.Body = http.NoBody
 			req.GetBody = func() (io.ReadCloser, error) { return http.NoBody, nil }
 		}

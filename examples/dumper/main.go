@@ -253,6 +253,7 @@ func httpInterceptor(ctx context.Context, req *http.Request, invoker mitmpgo.HTT
 		slog.Duration("request_latency", time.Since(md.RequestProcessedTs)),
 		slog.String("status", rsp.Status),
 		slog.String("protocol", rsp.Proto),
+		slog.Any("headers", map[string][]string(rsp.Header)),
 	)
 
 	rsp.Body, err = newBodyDecoder(rsp.Body, rsp.Header.Get("Content-Encoding"), CHUNK_TYPE_RSP)
