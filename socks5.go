@@ -87,7 +87,7 @@ func parseAddressForSocks5(r io.Reader, buf *buf.Buffer, offset int) (host strin
 		offset += net.IPv4len
 		port = binary.BigEndian.Uint16(buf.Slice(offset, offset+2))
 	case 0x4: // ipv6
-		if _, err = buf.ReadFull(r, net.IPv4len+2); err != nil { // ipv6 + port
+		if _, err = buf.ReadFull(r, net.IPv6len+2); err != nil { // ipv6 + port
 			return
 		}
 		offset++
