@@ -422,16 +422,6 @@ func (r *mitmProxyHandler) initiateSSLHandshakeWithClientHello(ctx context.Conte
 		// fallback to http/1.1 if the server doesn't support ALPN or doesn't return the negotiated protocol
 		cs.NegotiatedProtocol = "http/1.1"
 	}
-
-	// Get server certificate from local cache pool
-	if serverCert, err := r.serverCertPool.Get(host); err == nil {
-		return tlsClientConn, &tls.Config{
-			SessionTicketsDisabled: true,
-			// Server selected negotiated protocol
-			NextProtos:   []string{cs.NegotiatedProtocol},
-			Certificates: []tls.Certificate{serverCert},
-		}, nil
-	}
 	var foundCert *x509.Certificate
 	for _, cert := range cs.PeerCertificates {
 		if !cert.IsCA {
@@ -441,23 +431,6 @@ func (r *mitmProxyHandler) initiateSSLHandshakeWithClientHello(ctx context.Conte
 	if foundCert == nil {
 		return nil, nil, ErrServerCertUnavailable
 	}
-	// Get private key from local cache pool
-	privateKey, err := r.priKeyPool.Get()
-	if err != nil {
-		return nil, nil, err
-	}
-	serverCert, err := cert.NewCertificateBuilder().
-		ServerAuth().
-		ValidateDays(365).
-		PrivateKey(privateKey).
-		Subject(foundCert.Subject).
-		DNSNames(foundCert.DNSNames).
-		IPAddresses(foundCert.IPAddresses).
-		BuildFromCA(r.caCert)
-	if err != nil {
-		return nil, nil, err
-	}
-
 	md.Set(metadata.SSLHandshakeCompletedTs, tlsConnEstTs)
 	md.Set(metadata.ConnectionTLSState, &metadata.TLSState{
 		ServerName:          chi.ServerName,
@@ -480,6 +453,32 @@ func (r *mitmProxyHandler) initiateSSLHandshakeWithClientHello(ctx context.Conte
 		IPAddresses:        foundCert.IPAddresses,
 		RawContent:         foundCert.Raw,
 	})
+
+	// Get server certificate from local cache pool
+	if serverCert, err := r.serverCertPool.Get(host); err == nil {
+		return tlsClientConn, &tls.Config{
+			SessionTicketsDisabled: true,
+			// Server selected negotiated protocol
+			NextProtos:   []string{cs.NegotiatedProtocol},
+			Certificates: []tls.Certificate{serverCert},
+		}, nil
+	}
+	// Get private key from local cache pool
+	privateKey, err := r.priKeyPool.Get()
+	if err != nil {
+		return nil, nil, err
+	}
+	serverCert, err := cert.NewCertificateBuilder().
+		ServerAuth().
+		ValidateDays(365).
+		PrivateKey(privateKey).
+		Subject(foundCert.Subject).
+		DNSNames(foundCert.DNSNames).
+		IPAddresses(foundCert.IPAddresses).
+		BuildFromCA(r.caCert)
+	if err != nil {
+		return nil, nil, err
+	}
 
 	certificate := serverCert.Certificate()
 	r.serverCertPool.Set(host, certificate)
