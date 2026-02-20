@@ -172,7 +172,6 @@ func main() {
 					return
 				}
 				go func() {
-					defer conn.Close()
 					handler.ServeSOCKS5(context.Background(), conn)
 				}()
 			}

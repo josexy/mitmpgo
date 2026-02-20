@@ -41,7 +41,7 @@ type contextKey struct {
 func (k *contextKey) String() string { return "mitmpgo context value " + k.name }
 
 var (
-	connContextKey = &contextKey{"server-net-conn"}
+	connContextKey = &contextKey{"connection-context"}
 	reqContextKey  = &contextKey{"request-context"}
 )
 
@@ -51,12 +51,7 @@ type ReqContext struct {
 	HttpConnectMethod bool
 }
 
-func AppendToRequestContext(ctx context.Context, hostport string, request *http.Request, httpConnectMethod bool) context.Context {
-	reqCtx := ReqContext{
-		Hostport:          hostport,
-		Request:           request,
-		HttpConnectMethod: httpConnectMethod,
-	}
+func AppendToRequestContext(ctx context.Context, reqCtx ReqContext) context.Context {
 	return context.WithValue(ctx, reqContextKey, reqCtx)
 }
 
@@ -119,6 +114,64 @@ func (f *fakeHttpResponseWriter) Header() http.Header       { return f.header }
 func (f *fakeHttpResponseWriter) Write([]byte) (int, error) { return 0, nil }
 func (f *fakeHttpResponseWriter) WriteHeader(int)           {}
 
+type localClientConn struct {
+	net.Conn
+	connCtx   *biConnContext
+	closeChan chan struct{}
+	lock      sync.Mutex
+	closed    bool
+	closeErr  error
+}
+
+type remoteClientConn struct {
+	net.Conn
+	connCtx   *biConnContext
+	innerConn net.Conn
+	lock      sync.Mutex
+	closed    bool
+	closeErr  error
+}
+
+func (c *localClientConn) waitClose() { <-c.closeChan }
+
+func (c *localClientConn) Close() error {
+	c.lock.Lock()
+	if c.closed {
+		c.lock.Unlock()
+		return c.closeErr
+	}
+	c.closed = true
+	c.closeErr = c.Conn.Close()
+	c.lock.Unlock()
+	close(c.closeChan)
+
+	if c.connCtx.remote != nil {
+		c.connCtx.remote.Close()
+	}
+	return c.closeErr
+}
+
+func (c *remoteClientConn) Close() error {
+	c.lock.Lock()
+	if c.closed {
+		c.lock.Unlock()
+		return c.closeErr
+	}
+	c.closed = true
+	c.closeErr = c.Conn.Close()
+	c.lock.Unlock()
+
+	if c.connCtx.local != nil {
+		c.connCtx.local.Close()
+	}
+	return c.closeErr
+}
+
+type biConnContext struct {
+	local  *localClientConn
+	remote *remoteClientConn
+}
+
 type ErrorContext struct {
 	RemoteAddr string
 	Hostport   string
@@ -130,9 +183,10 @@ type ErrorHandler func(ErrorContext)
 type MitmProxyHandler interface {
 	CACertPath() string
 
-	// low-level api
+	// low-level api, Serve will take over net.Conn and call the Close function.
 	Serve(context.Context, net.Conn) error
 	// high-level application api
+	// ServeSOCKS5 will take over net.Conn and call the Close function
 	ServeSOCKS5(context.Context, net.Conn) error
 	ServeHTTP(http.ResponseWriter, *http.Request)
 }
@@ -187,8 +241,8 @@ func NewMitmProxyHandler(opt ...Option) (MitmProxyHandler, error) {
 	}
 
 	dialFn := func(ctx context.Context, network, addr string) (net.Conn, error) {
-		if conn, ok := ctx.Value(connContextKey).(net.Conn); ok {
-			return conn, nil
+		if connCtx, ok := ctx.Value(connContextKey).(*biConnContext); ok {
+			return connCtx.remote.innerConn, nil
 		}
 		return nil, errors.New("connContextKey missing in context")
 	}
@@ -260,10 +314,10 @@ func (r *mitmProxyHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if err != nil {
 		return
 	}
-	defer conn.Close()
 	request := req
 	hostport, err = ParseHostPort(req)
 	if err != nil {
+		conn.Close()
 		return
 	}
 	if req.Method == http.MethodConnect {
@@ -271,9 +325,14 @@ func (r *mitmProxyHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	} else if req.URL != nil && len(req.URL.Scheme) == 0 {
 		// directly access proxy server and url scheme is empty
 		err = ErrInvalidProxyRequest
+		conn.Close()
 		return
 	}
-	_ = r.Serve(AppendToRequestContext(req.Context(), hostport, request, req.Method == http.MethodConnect), conn)
+	_ = r.Serve(AppendToRequestContext(req.Context(), ReqContext{
+		Hostport:          hostport,
+		Request:           request,
+		HttpConnectMethod: req.Method == http.MethodConnect,
+	}), conn)
 }
 
 func (r *mitmProxyHandler) ServeSOCKS5(ctx context.Context, conn net.Conn) error {
@@ -289,18 +348,25 @@ func (r *mitmProxyHandler) ServeSOCKS5(ctx context.Context, conn net.Conn) error
 		}
 	}()
 	if err = r.handleSocks5Handshake(ctx, conn); err != nil {
+		conn.Close()
 		return err
 	}
 	if hostport, err = r.handleSocks5Request(ctx, conn); err != nil {
+		conn.Close()
 		return err
 	}
-	retErr := r.Serve(AppendToRequestContext(ctx, hostport, nil, false), conn)
+	retErr := r.Serve(AppendToRequestContext(ctx, ReqContext{
+		Hostport:          hostport,
+		Request:           nil,
+		HttpConnectMethod: false,
+	}), conn)
 	return retErr
 }
 
 func (r *mitmProxyHandler) Serve(ctx context.Context, conn net.Conn) (err error) {
 	reqCtx, ok := FromRequestContext(ctx)
 	if !ok {
+		conn.Close()
 		return ErrRequestContextMissing
 	}
 
@@ -316,9 +382,23 @@ func (r *mitmProxyHandler) Serve(ctx context.Context, conn net.Conn) (err error)
 
 	dstConn, err := r.proxyDialer.DialTCPContext(ctx, reqCtx.Hostport)
 	if err != nil {
-		return err
+		conn.Close()
+		return fmt.Errorf("failed to connect to %s: %s", reqCtx.Hostport, err)
 	}
-	defer dstConn.Close()
+
+	local := &localClientConn{
+		Conn:      conn,
+		closeChan: make(chan struct{}),
+	}
+	remote := &remoteClientConn{
+		Conn: dstConn,
+	}
+	connCtx := &biConnContext{local, remote}
+	local.connCtx, remote.connCtx = connCtx, connCtx
+	conn, dstConn = local, remote
+	remote.innerConn = remote
+
+	defer local.Close()
 
 	nowTs := time.Now()
 
@@ -336,9 +416,9 @@ func (r *mitmProxyHandler) Serve(ctx context.Context, conn net.Conn) (err error)
 	md.Set(metadata.RequestHostport, reqCtx.Hostport)
 	md.Set(metadata.ConnectionSourceAddrPort, getAddrPortFromConn(conn))
 	md.Set(metadata.ConnectionDestinationAddrPort, getAddrPortFromConn(dstConn))
-	ctx = metadata.AppendToContext(ctx, md)
+	ctx = context.WithValue(metadata.AppendToContext(ctx, md), connContextKey, connCtx)
 
-	return r.handleTunnelRequest(ctx, conn, dstConn, reqCtx.Request != nil)
+	return r.handleTunnelRequest(ctx, reqCtx.Request != nil)
 }
 
 func (r *mitmProxyHandler) shouldPassthroughRequest(hostport string) bool {
@@ -499,7 +579,11 @@ func isTLS(data []byte) bool {
 	return data[0] == 0x16 && data[1] == 0x03 && data[2] <= 0x03
 }
 
-func (r *mitmProxyHandler) handleTunnelRequest(ctx context.Context, srcConn, dstConn net.Conn, consumedRequest bool) (err error) {
+func (r *mitmProxyHandler) handleTunnelRequest(ctx context.Context, consumedRequest bool) (err error) {
+	connCtx := ctx.Value(connContextKey).(*biConnContext)
+	var srcConn net.Conn = connCtx.local
+	var dstConn net.Conn = connCtx.remote
+
 	var data []byte
 
 	if !consumedRequest {
@@ -561,6 +645,7 @@ func (r *mitmProxyHandler) handleTunnelRequest(ctx context.Context, srcConn, dst
 		}
 		// wait for tls handshake
 		dstConn = <-tlsConnCh
+		connCtx.remote.innerConn = dstConn
 		srcConn = tlsConn
 
 		state := tlsConn.ConnectionState()
@@ -569,17 +654,15 @@ func (r *mitmProxyHandler) handleTunnelRequest(ctx context.Context, srcConn, dst
 		// and finally we only need to get the [http.Request] and process the [http.ResponseWriter].
 		// Early process http2
 		if state.NegotiatedProtocol == http2.NextProtoTLS {
-			ctx = context.WithValue(ctx, connContextKey, dstConn)
+			newCtx, cancel := context.WithCancel(context.Background())
+			go func() {
+				connCtx.local.waitClose()
+				cancel()
+			}()
 			r.h2s.ServeConn(srcConn, &http2.ServeConnOpts{
-				Context: ctx, // set context to request context
+				Context: newCtx,
 				Handler: r.serveHTTP2Handler(ctx),
 			})
-			return
-		}
-	} else {
-		reqCtx, _ := FromRequestContext(ctx)
-		dstConn, err = r.proxyDialer.DialTCPContext(ctx, reqCtx.Hostport)
-		if err != nil {
 			return
 		}
 	}
@@ -591,19 +674,24 @@ func (r *mitmProxyHandler) handleTunnelRequest(ctx context.Context, srcConn, dst
 	if isWsUpgrade {
 		return r.relayConnForWS(ctx, srcConn, dstConn)
 	}
-	return r.relayConnForHTTP(ctx, srcConn, dstConn)
+	return r.relayConnForHTTP(ctx, srcConn)
 }
 
-func (r *mitmProxyHandler) handleH2CRequest(ctx context.Context, rw http.ResponseWriter, req *http.Request, dstConn net.Conn) (bool, error) {
+func (r *mitmProxyHandler) handleH2CRequest(ctx context.Context, rw http.ResponseWriter, req *http.Request) (bool, error) {
 	// Handle h2c with prior knowledge (RFC 7540 Section 3.4)
 	if req.Method == "PRI" && len(req.Header) == 0 && req.URL.Path == "*" && req.Proto == "HTTP/2.0" {
 		conn, err := initH2CWithPriorKnowledge(rw)
 		if err != nil {
 			return false, err
 		}
-		ctx = context.WithValue(ctx, connContextKey, dstConn)
+		connCtx := ctx.Value(connContextKey).(*biConnContext)
+		newCtx, cancel := context.WithCancel(context.Background())
+		go func() {
+			connCtx.local.waitClose()
+			cancel()
+		}()
 		r.h2s.ServeConn(conn, &http2.ServeConnOpts{
-			Context:          ctx,
+			Context:          newCtx,
 			Handler:          r.serveHTTP2Handler(ctx),
 			SawClientPreface: true,
 		})
@@ -616,9 +704,14 @@ func (r *mitmProxyHandler) handleH2CRequest(ctx context.Context, rw http.Respons
 		if err != nil {
 			return false, err
 		}
-		ctx = context.WithValue(ctx, connContextKey, dstConn)
+		connCtx := ctx.Value(connContextKey).(*biConnContext)
+		newCtx, cancel := context.WithCancel(context.Background())
+		go func() {
+			connCtx.local.waitClose()
+			cancel()
+		}()
 		r.h2s.ServeConn(conn, &http2.ServeConnOpts{
-			Context:        ctx,
+			Context:        newCtx,
 			Handler:        r.serveHTTP2Handler(ctx),
 			UpgradeRequest: req,
 			Settings:       settings,
@@ -651,7 +744,7 @@ func (r *mitmProxyHandler) distinguishHTTPRequest(ctx context.Context, srcConn, 
 
 	if !r.disableHTTP2 {
 		// If it's a SOCKS proxy, then the request might be h2c.
-		earlyDone, retErr = r.handleH2CRequest(ctx, fakerw, request, dstConn)
+		earlyDone, retErr = r.handleH2CRequest(ctx, fakerw, request)
 		if retErr != nil || earlyDone {
 			return
 		}
@@ -675,7 +768,7 @@ func (r *mitmProxyHandler) distinguishHTTPRequest(ctx context.Context, srcConn, 
 	removeProxyHeaders(request.Header)
 	// patch the new request to the request context
 	reqCtx.Request = request
-	newCtx = AppendToRequestContext(ctx, reqCtx.Hostport, reqCtx.Request, false)
+	newCtx = AppendToRequestContext(ctx, reqCtx)
 
 	return
 }
@@ -793,11 +886,8 @@ func (r *mitmProxyHandler) relayConnForWS(ctx context.Context, srcConn, dstConn 
 	return
 }
 
-func (r *mitmProxyHandler) relayConnForHTTP(ctx context.Context, srcConn, dstConn net.Conn) (err error) {
+func (r *mitmProxyHandler) relayConnForHTTP(ctx context.Context, srcConn net.Conn) (err error) {
 	reqCtx, _ := FromRequestContext(ctx)
-	// set to request context
-	ctx = context.WithValue(ctx, connContextKey, dstConn)
-
 	response, err := r.roundTripWithContext(ctx, reqCtx.Request)
 	if err != nil {
 		return err
@@ -808,13 +898,21 @@ func (r *mitmProxyHandler) relayConnForHTTP(ctx context.Context, srcConn, dstCon
 }
 
 func (r *mitmProxyHandler) roundTripWithContext(ctx context.Context, req *http.Request) (response *http.Response, err error) {
-	conn, _ := ctx.Value(connContextKey).(net.Conn)
-	req = req.WithContext(context.WithValue(req.Context(), connContextKey, conn))
+	connCtx := ctx.Value(connContextKey).(*biConnContext)
+	reqCtx, _ := FromRequestContext(ctx)
+	md, _ := metadata.FromContext(ctx)
+
+	reqCtx.Request = req
+	ctx = metadata.AppendToContext(AppendToRequestContext(req.Context(), reqCtx), md)
+	req = req.WithContext(context.WithValue(ctx, connContextKey, connCtx))
 	// Only one http interceptor will be invoked
 	if r.httpInt != nil {
 		response, err = r.httpInt(ctx, req, HTTPDelegatedInvokerFunc(r.transport.RoundTrip))
 	} else {
 		response, err = r.transport.RoundTrip(req)
+	}
+	if err != nil {
+		err = fmt.Errorf("transport RoundTrip %s failed: %s", reqCtx.Hostport, err)
 	}
 	return
 }
@@ -884,7 +982,7 @@ func (r *mitmProxyHandler) serveHTTP2Handler(ctx context.Context) http.Handler {
 				r.handleError(ErrorContext{
 					Hostport:   reqCtx.Hostport,
 					RemoteAddr: req.RemoteAddr,
-					Error:      err,
+					Error:      fmt.Errorf("write http2 body failed: %s", err),
 				})
 				return
 			}
