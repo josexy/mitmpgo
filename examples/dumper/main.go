@@ -194,6 +194,7 @@ func main() {
 	signal.Notify(inter, syscall.SIGINT)
 	<-inter
 
+	handler.Cleanup()
 	slog.Info("exit")
 	closeFn()
 	time.Sleep(time.Millisecond * 100)

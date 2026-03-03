@@ -62,6 +62,7 @@ func main() {
 		panic(err)
 	}
 
+	defer handler.Cleanup()
 	slog.Info("server started")
 	http.ListenAndServe(fmt.Sprintf("%s:%d", "127.0.0.1", port), handler)
 }

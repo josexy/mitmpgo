@@ -189,6 +189,8 @@ type MitmProxyHandler interface {
 	// ServeSOCKS5 will take over net.Conn and call the Close function
 	ServeSOCKS5(context.Context, net.Conn) error
 	ServeHTTP(http.ResponseWriter, *http.Request)
+
+	Cleanup()
 }
 
 type mitmProxyHandler struct {
@@ -287,6 +289,10 @@ func (r *mitmProxyHandler) chainHTTPInterceptors() {
 		chainedInt = chainHTTPInterceptors(interceptors)
 	}
 	r.httpInt = chainedInt
+}
+
+func (r *mitmProxyHandler) Cleanup() {
+	r.serverCertPool.Stop()
 }
 
 func (r *mitmProxyHandler) CACertPath() string {

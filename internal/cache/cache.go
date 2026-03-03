@@ -51,6 +51,7 @@ type ShardedLRU[K comparable, V any] struct {
 	*options
 	nowUnixNano int64
 	hasher      Hasher[K]
+	onceClose   sync.Once
 	closeCh     chan struct{}
 	shards      []*cacheShard[K, V]
 }
@@ -227,7 +228,9 @@ func (c *ShardedLRU[K, V]) cleanupCycle() {
 }
 
 func (c *ShardedLRU[K, V]) Stop() {
-	close(c.closeCh)
+	c.onceClose.Do(func() {
+		close(c.closeCh)
+	})
 }
 
 func (s *cacheShard[K, V]) addToHead(n *entry[K, V]) {

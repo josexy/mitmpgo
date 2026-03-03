@@ -64,6 +64,7 @@ func newServerCertPool(capacity int, bgCheckInterval, certExpired time.Duration)
 	return &certPool{
 		Cache: cache.NewStringCache[tls.Certificate](
 			cache.WithCapacity(capacity),
+			cache.WithStdGoTimeUnixNano(),
 			cache.WithBackgroundCheckInterval(bgCheckInterval),
 			cache.WithExpiration(certExpired),
 			cache.WithUpdateCacheExpirationOnGet(),
