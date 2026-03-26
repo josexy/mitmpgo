@@ -683,7 +683,7 @@ func (r *mitmProxyHandler) handleTunnelRequest(ctx context.Context, consumedRequ
 	return r.relayConnForHTTP(ctx, srcConn)
 }
 
-func (r *mitmProxyHandler) handleH2CRequest(ctx context.Context, rw http.ResponseWriter, req *http.Request) (bool, error) {
+func (r *mitmProxyHandler) handlePrefaceOrH2CRequest(ctx context.Context, rw http.ResponseWriter, req *http.Request) (bool, error) {
 	// Handle h2c with prior knowledge (RFC 7540 Section 3.4)
 	if req.Method == "PRI" && len(req.Header) == 0 && req.URL.Path == "*" && req.Proto == "HTTP/2.0" {
 		conn, err := initH2CWithPriorKnowledge(rw)
@@ -750,7 +750,7 @@ func (r *mitmProxyHandler) distinguishHTTPRequest(ctx context.Context, srcConn n
 
 	if !r.disableHTTP2 {
 		// If it's a SOCKS proxy, then the request might be h2c.
-		earlyDone, retErr = r.handleH2CRequest(ctx, fakerw, request)
+		earlyDone, retErr = r.handlePrefaceOrH2CRequest(ctx, fakerw, request)
 		if retErr != nil || earlyDone {
 			return
 		}
